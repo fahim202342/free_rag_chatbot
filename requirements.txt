@@ -10,3 +10,8 @@ sentence-transformers>=2.5.0
 torch>=2.0.0
 PyYAML>=6.0
 pandas>=2.0.0
+
+# Pin protobuf to fix ChromaDB/OpenTelemetry compatibility
+protobuf>=4.25.0,<5.0.0
+googleapis-common-protos>=1.62.0
+grpcio>=1.62.0
