@@ -1,10 +1,3 @@
-import os
-os.environ["OTEL_SDK_DISABLED"] = "true"
-
-import streamlit as st
-# ... rest of imports
-
-
 import streamlit as st
 import os
 import tempfile
