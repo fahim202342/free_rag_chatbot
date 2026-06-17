@@ -8,6 +8,7 @@ import time
 import gc
 import uuid
 import base64
+import io
 
 from dotenv import load_dotenv
 
@@ -23,14 +24,12 @@ from operator import itemgetter
 import pandas as pd
 import chromadb
 
-
 # ========== LOAD API KEYS ==========
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 if GROQ_API_KEY:
     os.environ["GROQ_API_KEY"] = GROQ_API_KEY
 
-# ========== PAGE SETUP ==========
 st.set_page_config(page_title="Free RAG Chatbot", page_icon="🤖")
 
 st.title("🤖 Free RAG Chatbot")
@@ -87,96 +86,14 @@ def safe_delete_user_db():
     return False
 
 
-# ========== SESSION STATE ==========
-if "processed" not in st.session_state:
-    st.session_state.processed = False
-if "upload_key" not in st.session_state:
-    st.session_state.upload_key = 0
-if "mobile_files" not in st.session_state:
-    st.session_state.mobile_files = []
-
 uploaded_meta = load_meta()
 
+# ========== CRITICAL: MOBILE FILE UPLOAD ==========
+# Use query params to receive files from JavaScript
+# This avoids st.file_uploader completely on mobile
 
-# ========== MOBILE-FRIENDLY FILE UPLOAD ==========
-# Use HTML5 file input + base64 encoding for mobile compatibility
-
-upload_html = """
-<style>
-.upload-area {
-    border: 2px dashed #4CAF50;
-    border-radius: 10px;
-    padding: 20px;
-    text-align: center;
-    background: #f8fff8;
-    margin: 10px 0;
-}
-.upload-area:active {
-    background: #e8f5e9;
-}
-.file-input {
-    display: none;
-}
-.upload-btn {
-    background: #4CAF50;
-    color: white;
-    padding: 12px 24px;
-    border: none;
-    border-radius: 8px;
-    font-size: 16px;
-    cursor: pointer;
-    width: 100%;
-}
-.file-list {
-    margin-top: 10px;
-    font-size: 14px;
-    color: #333;
-}
-</style>
-
-<div class="upload-area">
-    <input type="file" id="fileInput" class="file-input" accept=".pdf" multiple 
-           onchange="handleFiles(this.files)">
-    <button class="upload-btn" onclick="document.getElementById('fileInput').click()">
-        📎 Select PDF Files
-    </button>
-    <div id="fileList" class="file-list"></div>
-</div>
-
-<script>
-let selectedFiles = [];
-let fileData = {};
-
-function handleFiles(files) {
-    selectedFiles = Array.from(files);
-    const list = document.getElementById('fileList');
-    list.innerHTML = '<p><strong>Selected:</strong></p>';
-    
-    let processed = 0;
-    
-    selectedFiles.forEach((file, index) => {
-        const reader = new FileReader();
-        reader.onload = function(e) {
-            // Store base64 data with filename
-            const base64 = e.target.result.split(',')[1];
-            fileData[file.name] = base64;
-            
-            list.innerHTML += `<div>• ${file.name} (${(file.size/1024).toFixed(1)} KB)</div>`;
-            
-            processed++;
-            if (processed === selectedFiles.length) {
-                // Send to Streamlit
-                window.parent.postMessage({
-                    type: 'streamlit:setComponentValue',
-                    value: JSON.stringify(fileData)
-                }, '*');
-            }
-        };
-        reader.readAsDataURL(file);
-    });
-}
-</script>
-"""
+query_params = st.query_params
+file_data_json = query_params.get("files", None)
 
 # ========== SIDEBAR ==========
 with st.sidebar:
@@ -184,76 +101,93 @@ with st.sidebar:
     st.caption(f"🔐 Session: `{USER_ID}`")
     st.divider()
     
-    # MOBILE FIX: Use components.html for native file picker
-    import streamlit.components.v1 as components
+    # Method 1: HTML5 File Input (Mobile Compatible)
+    st.markdown("### 📱 Upload PDF")
     
-    # Container for file upload
-    file_container = st.container()
+    # Create a form that submits via URL params (no page reload)
+    upload_component = """
+    <form id="uploadForm" style="margin:0;padding:0;">
+        <input type="file" id="pdfInput" accept="application/pdf" style="display:none;" 
+               onchange="uploadFiles()">
+        <button type="button" onclick="document.getElementById('pdfInput').click()" 
+                style="width:100%;padding:12px;background:#4CAF50;color:white;
+                       border:none;border-radius:8px;font-size:16px;cursor:pointer;">
+            📎 Select PDF File
+        </button>
+        <div id="status" style="margin-top:10px;font-size:14px;color:#666;"></div>
+    </form>
     
-    with file_container:
-        # Try native HTML5 upload first (works better on mobile)
-        st.markdown("### 📱 Mobile Upload")
-        uploaded_data = components.html(upload_html, height=200, scrolling=False)
+    <script>
+    async function uploadFiles() {
+        const input = document.getElementById('pdfInput');
+        const file = input.files[0];
+        if (!file) return;
         
-        # Fallback: Standard Streamlit uploader for desktop
-        st.markdown("### 💻 Desktop Upload")
-        standard_files = st.file_uploader(
-            "Or use standard uploader",
-            type=["pdf"],
-            accept_multiple_files=True,
-            key=f"std_uploader_{USER_ID}_{st.session_state.upload_key}",
-            label_visibility="collapsed"
-        )
+        const status = document.getElementById('status');
+        status.innerHTML = '⏳ Reading...';
+        
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            const base64 = e.target.result.split(',')[1];
+            // Store in localStorage temporarily
+            localStorage.setItem('pending_pdf', JSON.stringify({
+                name: file.name,
+                data: base64,
+                size: file.size,
+                user: '""" + USER_ID + """'
+            }));
+            status.innerHTML = '✅ Ready! Click Process below.';
+            // Notify Streamlit
+            window.parent.postMessage({type: 'streamlit:fileReady'}, '*');
+        };
+        reader.readAsDataURL(file);
+    }
+    </script>
+    """
     
-    # Collect files from both sources
-    all_files = []
+    st.components.v1.html(upload_component, height=120)
     
-    # Process HTML5 uploaded files (mobile)
-    if uploaded_data and isinstance(uploaded_data, str):
+    # Check localStorage via another component
+    check_component = """
+    <script>
+    (function() {
+        const data = localStorage.getItem('pending_pdf');
+        if (data) {
+            const fileInfo = JSON.parse(data);
+            // Send to Streamlit via URL param
+            const currentUrl = new URL(window.location.href);
+            currentUrl.searchParams.set('files', btoa(data));
+            window.history.replaceState({}, '', currentUrl);
+            localStorage.removeItem('pending_pdf');
+        }
+    })();
+    </script>
+    """
+    st.components.v1.html(check_component, height=0)
+    
+    # Read file from query params
+    pending_file = None
+    if file_data_json:
         try:
-            import json as json_mod
-            file_dict = json_mod.loads(uploaded_data)
-            for fname, fbase64 in file_dict.items():
-                file_bytes = base64.b64decode(fbase64)
-                # Create temp file
-                tmp_path = os.path.join(tempfile.gettempdir(), f"mobile_{USER_ID}_{fname}")
-                with open(tmp_path, 'wb') as f:
-                    f.write(file_bytes)
-                all_files.append({
-                    'name': fname,
-                    'path': tmp_path,
-                    'size': len(file_bytes),
-                    'source': 'mobile'
-                })
-        except Exception as e:
-            st.error(f"Mobile upload error: {e}")
+            file_info = json.loads(base64.b64decode(file_data_json).decode())
+            if file_info.get("user") == USER_ID:
+                pending_file = file_info
+                # Clear param
+                st.query_params.clear()
+        except Exception:
+            pass
     
-    # Process standard uploaded files (desktop)
-    if standard_files:
-        for f in standard_files:
-            tmp_path = os.path.join(tempfile.gettempdir(), f"desktop_{USER_ID}_{f.name}")
-            with open(tmp_path, 'wb') as tmp:
-                tmp.write(f.getvalue())
-            all_files.append({
-                'name': f.name,
-                'path': tmp_path,
-                'size': f.size,
-                'source': 'desktop'
-            })
-    
-    # Show selected files
-    if all_files:
-        st.session_state.mobile_files = all_files
-        st.info(f"📎 {len(all_files)} file(s) ready")
-        for f in all_files:
-            st.caption(f"• {f['name']} ({f['size']/1024:.0f} KB)")
+    # Show file info
+    if pending_file:
+        st.success(f"📎 {pending_file['name']}")
+        st.info(f"Size: {pending_file['size']/1024:.1f} KB")
     
     # Process button
     process_btn = st.button(
-        "🚀 Process Documents",
+        "🚀 Process Document",
         type="primary",
         use_container_width=True,
-        disabled=not all_files
+        disabled=not pending_file
     )
     
     # Show processed files
@@ -262,114 +196,76 @@ with st.sidebar:
         for fname in uploaded_meta.values():
             st.text(f"✅ {fname}")
     
-    # Clear button
+    # Clear
     if st.button("🗑️ Clear My Documents", use_container_width=True):
         safe_delete_user_db()
-        st.session_state.processed = False
-        st.session_state.upload_key += 1
-        st.session_state.mobile_files = []
+        st.session_state.upload_key = 0
         st.cache_resource.clear()
         st.rerun()
     
     st.divider()
-    st.caption("🔒 Your files are private")
-
+    st.caption("🔒 Private & Isolated")
 
 # ========== PROCESSING ==========
-def process_files_with_gc(files_info, meta):
+if process_btn and pending_file:
+    st.subheader("🔄 Processing...")
+    
+    # Decode and save
+    file_bytes = base64.b64decode(pending_file['data'])
+    tmp_path = os.path.join(tempfile.gettempdir(), f"{USER_ID}_{pending_file['name']}")
+    
+    with open(tmp_path, 'wb') as f:
+        f.write(file_bytes)
+    
+    # Process
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
         model_kwargs={'device': 'cpu'}
     )
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=150
-    )
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     
     os.makedirs(CHROMA_DB_PATH, exist_ok=True)
     client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
     
     try:
-        vectordb = Chroma(
-            client=client,
-            embedding_function=embeddings,
-            collection_name="docs"
-        )
+        vectordb = Chroma(client=client, embedding_function=embeddings, collection_name="docs")
     except Exception:
-        vectordb = Chroma(
-            client=client,
-            embedding_function=embeddings,
-            collection_name="docs",
-            persist_directory=CHROMA_DB_PATH
-        )
+        vectordb = Chroma(client=client, embedding_function=embeddings, collection_name="docs", persist_directory=CHROMA_DB_PATH)
     
-    progress = st.progress(0)
-    status = st.empty()
-    new_files = []
+    file_hash = hashlib.md5(file_bytes).hexdigest()
     
-    for i, finfo in enumerate(files_info):
-        status.text(f"⏳ {i+1}/{len(files_info)}: {finfo['name']}")
-        
-        # Read file bytes
-        with open(finfo['path'], 'rb') as f:
-            file_bytes = f.read()
-        
-        file_hash = hashlib.md5(file_bytes).hexdigest()
-        if file_hash in meta:
-            progress.progress((i + 1) / len(files_info))
-            continue
-        
-        try:
-            loader = PyMuPDFLoader(finfo['path'])
+    if file_hash not in uploaded_meta:
+        with st.spinner("Loading PDF..."):
+            loader = PyMuPDFLoader(tmp_path)
             docs = loader.load()
             chunks = text_splitter.split_documents(docs)
             
             for chunk in chunks:
-                chunk.metadata["source"] = finfo['name']
+                chunk.metadata["source"] = pending_file['name']
             
             vectordb.add_documents(chunks)
-            meta[file_hash] = finfo['name']
-            new_files.append(finfo['name'])
+            uploaded_meta[file_hash] = pending_file['name']
+            save_meta(uploaded_meta)
             
-        except Exception as e:
-            st.error(f"❌ {finfo['name']}: {str(e)}")
-        finally:
-            # Clean temp file
-            try:
-                os.unlink(finfo['path'])
-            except:
-                pass
-            gc.collect()
-        
-        progress.progress((i + 1) / len(files_info))
-    
-    progress.empty()
-    status.empty()
-    return new_files, meta
-
-
-if process_btn and st.session_state.mobile_files:
-    st.subheader("🔄 Processing...")
-    
-    new_files, uploaded_meta = process_files_with_gc(
-        st.session_state.mobile_files,
-        uploaded_meta
-    )
-    
-    if new_files:
-        save_meta(uploaded_meta)
-        st.success(f"✅ Done: {', '.join(new_files)}")
-        st.session_state.processed = True
-        st.session_state.mobile_files = []
-        st.cache_resource.clear()
-        st.balloons()
-        st.rerun()
+            st.success(f"✅ {pending_file['name']} processed!")
+            st.balloons()
     else:
         st.info("ℹ️ Already processed")
-        st.session_state.mobile_files = []
+    
+    # Cleanup
+    try:
+        os.unlink(tmp_path)
+    except:
+        pass
+    gc.collect()
+    
+    # Clear pending
+    pending_file = None
+    st.cache_resource.clear()
+    time.sleep(1)
+    st.rerun()
 
-
-# ========== RETRIEVER ==========
+# ========== RETRIEVER & CHAT ==========
 MODEL = "llama-3.3-70b-versatile"
 TEMP = 0.1
 K_DOCS = 3
@@ -385,22 +281,16 @@ def get_retriever(user_id):
         model_kwargs={'device': 'cpu'}
     )
     client = chromadb.PersistentClient(path=user_chroma)
-    vectordb = Chroma(
-        client=client,
-        embedding_function=embeddings,
-        collection_name="docs"
-    )
+    vectordb = Chroma(client=client, embedding_function=embeddings, collection_name="docs")
     return vectordb.as_retriever(search_kwargs={"k": K_DOCS})
 
 
 retriever = get_retriever(USER_ID)
 
 if retriever is None:
-    st.info("📤 Upload PDFs and click 'Process Documents'")
+    st.info("📤 Upload a PDF and click 'Process Document'")
     st.stop()
 
-
-# ========== LLM & CHAIN ==========
 llm = ChatGroq(model_name=MODEL, temperature=TEMP, streaming=True)
 
 qa_template = """You are a helpful AI assistant. Use ONLY the following context to answer the question. If the answer is not in the context, say you do not have enough information.
@@ -427,7 +317,6 @@ qa_rag_chain = (
 )
 
 
-# ========== STREAM HANDLERS ==========
 class StreamHandler(BaseCallbackHandler):
     def __init__(self, container):
         self.container = container
@@ -459,7 +348,6 @@ class PostMessageHandler(BaseCallbackHandler):
                 st.dataframe(pd.DataFrame(self.sources[:3]), width=1000)
 
 
-# ========== CHAT ==========
 history = StreamlitChatMessageHistory(key=f"chat_{USER_ID}")
 
 if len(history.messages) == 0:
