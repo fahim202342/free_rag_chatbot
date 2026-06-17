@@ -1,310 +1,249 @@
 import streamlit as st
 import os
 import tempfile
-import hashlib
-import json
-import shutil
-import time
-
-from dotenv import load_dotenv
-
-# Fix imports for newer langchain versions
-from langchain_groq import ChatGroq
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.document_loaders import PyMuPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+import gc
+import fitz  # PyMuPDF
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.callbacks.base import BaseCallbackHandler
-from langchain_community.chat_message_histories import StreamlitChatMessageHistory
-from operator import itemgetter
-import pandas as pd
-import chromadb
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_groq import ChatGroq
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
 
+# ============ PAGE CONFIG ============
+st.set_page_config(
+    page_title="Free RAG Chatbot",
+    page_icon="🤖",
+    layout="wide"
+)
 
-# ========== LOAD API KEYS FROM .ENV ==========
-load_dotenv()
+# ============ CSS ============
+st.markdown("""
+<style>
+    .stFileUploader {max-width: 100%;}
+    .chat-message {padding: 1rem; border-radius: 0.5rem; margin-bottom: 0.5rem;}
+    .user-message {background-color: #e3f2fd;}
+    .bot-message {background-color: #f3e5f5;}
+</style>
+""", unsafe_allow_html=True)
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN", "")
+# ============ SESSION STATE INIT ============
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
+if "processed_files" not in st.session_state:
+    st.session_state.processed_files = set()
+if "conversation" not in st.session_state:
+    st.session_state.conversation = None
+if "upload_key" not in st.session_state:
+    st.session_state.upload_key = 0
 
-if GROQ_API_KEY:
-    os.environ["GROQ_API_KEY"] = GROQ_API_KEY
-
-# ========== PAGE SETUP ==========
-st.set_page_config(page_title="Free RAG Chatbot", page_icon="🤖")
-
-# ========== NORMAL USER CHAT INTERFACE ==========
-st.title("🤖 Free RAG Chatbot")
-st.caption("100% Free")
-
-# ========== API CHECK ==========
-if not GROQ_API_KEY:
-    st.error("❌ GROQ_API_KEY missing! Create a `.env` file with GROQ_API_KEY=your_key")
-    st.stop()
-
-# ========== PERSISTENT STORAGE SETUP ==========
-CHROMA_DB_PATH = "./chroma_db"
-META_FILE = "./uploaded_files_meta.json"
-
-
-def load_uploaded_meta():
-    if os.path.exists(META_FILE):
-        with open(META_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-
-def save_uploaded_meta(meta):
-    with open(META_FILE, "w") as f:
-        json.dump(meta, f)
-
-
-def safe_delete_chroma_db():
-    """Safely delete Chroma DB by releasing file locks first."""
-    if not os.path.exists(CHROMA_DB_PATH):
-        return True
-
-    # Try to release any chroma connections
-    try:
-        # Create a client and delete the collection first
-        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-        try:
-            client.delete_collection("docs")
-        except Exception:
-            pass
-        del client
-    except Exception:
-        pass
-
-    # Wait a moment for file handles to release
-    time.sleep(0.5)
-
-    # On Windows, we need to handle locked sqlite files
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            shutil.rmtree(CHROMA_DB_PATH)
-            return True
-        except PermissionError:
-            if attempt < max_retries - 1:
-                time.sleep(0.5)
-            else:
-                # Force delete by renaming first (Windows workaround)
-                try:
-                    temp_path = CHROMA_DB_PATH + "_old"
-                    if os.path.exists(temp_path):
-                        shutil.rmtree(temp_path)
-                    os.rename(CHROMA_DB_PATH, temp_path)
-                    # Try to delete the renamed folder
-                    shutil.rmtree(temp_path, ignore_errors=True)
-                    return True
-                except Exception:
-                    return False
-    return False
-
-
-uploaded_meta = load_uploaded_meta()
-
-# ========== DOCUMENT UPLOAD SIDEBAR ==========
+# ============ SIDEBAR ============
 with st.sidebar:
-    st.header("📤 Upload Documents")
+    st.header("📄 Upload Documents")
+    
+    # File uploader with unique key to force refresh
     uploaded_files = st.file_uploader(
         "Upload PDF files",
         type=["pdf"],
         accept_multiple_files=True,
-        key="pdf_uploader"
+        key=f"uploader_{st.session_state.upload_key}"
     )
-
-    if uploaded_files:
-        st.subheader("Processing...")
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
-
-        # Initialize or load Chroma
-        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-        vectordb = Chroma(
-            client=client,
-            embedding_function=embeddings,
-            collection_name="docs"
-        )
-
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1500,
-            chunk_overlap=200
-        )
-
-        new_files = []
-        for file in uploaded_files:
-            file_hash = hashlib.md5(file.getvalue()).hexdigest()
-            if file_hash in uploaded_meta:
-                continue
-
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(file.getvalue())
-                tmp_path = tmp.name
-
-            try:
-                loader = PyMuPDFLoader(tmp_path)
-                docs = loader.load()
-                chunks = text_splitter.split_documents(docs)
-
-                # Add source metadata
-                for chunk in chunks:
-                    chunk.metadata["source"] = file.name
-
-                vectordb.add_documents(chunks)
-                uploaded_meta[file_hash] = file.name
-                new_files.append(file.name)
-            except Exception as e:
-                st.error(f"Error processing {file.name}: {e}")
-            finally:
-                os.unlink(tmp_path)
-
-        if new_files:
-            save_uploaded_meta(uploaded_meta)
-            st.success(f"✅ Uploaded: {', '.join(new_files)}")
-            st.rerun()
-        else:
-            st.info("ℹ️ All files already uploaded.")
-
-    # Show uploaded files
-    if uploaded_meta:
-        st.subheader("📁 Uploaded Files")
-        for fh, fname in uploaded_meta.items():
-            st.text(f"• {fname}")
-
-    # Clear database option
-    if st.button("🗑️ Clear All Documents", type="secondary"):
-        success = safe_delete_chroma_db()
-        if os.path.exists(META_FILE):
-            try:
-                os.remove(META_FILE)
-            except Exception:
-                pass
-
-        if success:
-            st.success("Database cleared!")
-        else:
-            st.warning("⚠️ Could not fully clear DB. Please restart the app and try again.")
-
-        # Clear cache to force retriever recreation
-        st.cache_resource.clear()
+    
+    st.divider()
+    st.subheader("Processing Status")
+    
+    # Process button - IMPORTANT: Mobile friendly
+    process_clicked = st.button(
+        "🚀 Process Documents", 
+        type="primary",
+        use_container_width=True
+    )
+    
+    st.divider()
+    st.subheader("📁 Uploaded Files")
+    
+    if st.session_state.processed_files:
+        for fname in st.session_state.processed_files:
+            st.write(f"✅ {fname}")
+    else:
+        st.info("No files processed yet")
+    
+    if st.button("🗑️ Clear All", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.vectorstore = None
+        st.session_state.processed_files = set()
+        st.session_state.conversation = None
+        st.session_state.upload_key += 1  # Force uploader reset
+        # Clean chroma temp dir
+        chroma_path = os.path.join(tempfile.gettempdir(), "chroma_db")
+        if os.path.exists(chroma_path):
+            import shutil
+            shutil.rmtree(chroma_path, ignore_errors=True)
         st.rerun()
 
-# ========== RETRIEVER ==========
-MODEL = "llama-3.3-70b-versatile"
-TEMP = 0.1
-CHUNK_SIZE = 1500
-CHUNK_OVERLAP = 200
-K_DOCS = 3
+# ============ MAIN CONTENT ============
+st.title("🤖 Free RAG Chatbot")
+st.caption("100% Free - Powered by Groq & HuggingFace")
 
+# ============ PROCESSING LOGIC ============
+def extract_text_from_pdf(file_bytes):
+    """Memory-safe PDF text extraction"""
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    try:
+        text = ""
+        for page in doc:
+            text += page.get_text()
+            # Periodic GC to prevent mobile memory crash
+            if len(text) > 500000:  # Every ~500KB
+                gc.collect()
+        return text
+    finally:
+        doc.close()
+        gc.collect()
 
-@st.cache_resource(ttl="1h")
-def configure_retriever(csize, cover, k):
-    if os.path.exists(CHROMA_DB_PATH):
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
-        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-        vectordb = Chroma(
-            client=client,
-            embedding_function=embeddings,
-            collection_name="docs"
-        )
-        return vectordb.as_retriever(search_kwargs={"k": k})
-    return None
-
-
-retriever = configure_retriever(CHUNK_SIZE, CHUNK_OVERLAP, K_DOCS)
-
-if retriever is None:
-    st.info("📤 No documents uploaded yet. Please upload PDF files from the sidebar.")
-    st.stop()
-
-# ========== LLM & CHAIN ==========
-llm = ChatGroq(model_name=MODEL, temperature=TEMP, streaming=True)
-
-qa_template = """You are a helpful AI assistant. Use ONLY the following context to answer the question. If the answer is not in the context, say you do not have enough information.
-
-Context:
-{context}
-
-Question: {question}
-
-Answer:"""
-
-qa_prompt = ChatPromptTemplate.from_template(qa_template)
-
-
-def format_docs(docs):
-    return "\n\n".join([d.page_content for d in docs])
-
-
-qa_rag_chain = (
-    {"context": itemgetter("question") | retriever |
-     format_docs, "question": itemgetter("question")}
-    | qa_prompt
-    | llm
-)
-
-# ========== STREAM HANDLER ==========
-
-
-class StreamHandler(BaseCallbackHandler):
-    def __init__(self, container):
-        self.container = container
-        self.text = ""
-
-    def on_llm_new_token(self, token, **kwargs):
-        self.text += token
-        self.container.markdown(self.text)
-
-
-class PostMessageHandler(BaseCallbackHandler):
-    def __init__(self, placeholder):
-        self.placeholder = placeholder
-        self.sources = []
-
-    def on_retriever_end(self, documents, **kwargs):
-        for d in documents:
-            meta = {
-                "source": d.metadata.get("source", "Unknown"),
-                "page": d.metadata.get("page", "N/A"),
-                "content": d.page_content[:200]
-            }
-            self.sources.append(meta)
-
-    def on_llm_end(self, response, **kwargs):
-        if self.sources:
-            with self.placeholder.container():
-                st.markdown("---")
-                st.markdown("**Sources:**")
-                st.dataframe(pd.DataFrame(self.sources[:3]), width=1000)
-
-
-# ========== CHAT ==========
-history = StreamlitChatMessageHistory(key="langchain_messages")
-
-if len(history.messages) == 0:
-    history.add_ai_message("Hello! Ask me anything about your documents.")
-
-for msg in history.messages:
-    st.chat_message(msg.type).write(msg.content)
-
-if user_prompt := st.chat_input("Ask a question..."):
-    st.chat_message("human").write(user_prompt)
-
-    with st.chat_message("ai"):
-        stream_handler = StreamHandler(st.empty())
-        sources_placeholder = st.empty()
-        pm_handler = PostMessageHandler(sources_placeholder)
-
+def process_documents(uploaded_files):
+    """Process uploaded PDFs and create vector store"""
+    if not uploaded_files:
+        return False
+    
+    all_texts = []
+    new_files = []
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    total_files = len(uploaded_files)
+    
+    for idx, file in enumerate(uploaded_files):
+        if file.name in st.session_state.processed_files:
+            continue  # Skip already processed
+        
+        status_text.text(f"Processing: {file.name} ({idx+1}/{total_files})")
+        
         try:
-            response = qa_rag_chain.invoke(
-                {"question": user_prompt},
-                {"callbacks": [stream_handler, pm_handler]}
-            )
+            file_bytes = file.getvalue()
+            text = extract_text_from_pdf(file_bytes)
+            
+            if text.strip():
+                all_texts.append(text)
+                new_files.append(file.name)
+            else:
+                st.warning(f"⚠️ {file.name} - No text found")
+                
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"❌ Error in {file.name}: {str(e)}")
+        
+        progress_bar.progress((idx + 1) / total_files)
+        gc.collect()  # Critical for mobile
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    if not all_texts:
+        return False
+    
+    # Text splitting
+    with st.spinner("Splitting text into chunks..."):
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len
+        )
+        chunks = []
+        for text in all_texts:
+            chunks.extend(text_splitter.split_text(text))
+        gc.collect()
+    
+    # Embeddings (CPU-friendly for Streamlit Cloud)
+    with st.spinner("Creating embeddings... (this may take a minute)"):
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={'normalize_embeddings': True}
+        )
+        
+        # ChromaDB with temp directory
+        chroma_path = os.path.join(tempfile.gettempdir(), "chroma_db")
+        
+        # Clear old if exists (to avoid conflicts)
+        if os.path.exists(chroma_path):
+            import shutil
+            shutil.rmtree(chroma_path, ignore_errors=True)
+        
+        vectorstore = Chroma.from_texts(
+            texts=chunks,
+            embedding=embeddings,
+            persist_directory=chroma_path
+        )
+        gc.collect()
+    
+    # Setup conversation chain
+    with st.spinner("Setting up chat..."):
+        llm = ChatGroq(
+            api_key=st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY")),
+            model_name="llama3-8b-8192",
+            temperature=0.7
+        )
+        
+        memory = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True
+        )
+        
+        conversation = ConversationalRetrievalChain.from_llm(
+            llm=llm,
+            retriever=vectorstore.as_retriever(search_kwargs={"k": 4}),
+            memory=memory,
+            verbose=False
+        )
+    
+    # Update session state
+    st.session_state.vectorstore = vectorstore
+    st.session_state.conversation = conversation
+    st.session_state.processed_files.update(new_files)
+    
+    return True
+
+# ============ HANDLE PROCESSING ============
+if process_clicked and uploaded_files:
+    success = process_documents(uploaded_files)
+    if success:
+        st.success(f"✅ Processed {len(uploaded_files)} file(s)! Ready to chat.")
+        st.balloons()
+    else:
+        st.warning("No new files to process or all files empty.")
+    st.rerun()
+
+# ============ CHAT INTERFACE ============
+if not st.session_state.processed_files:
+    st.info("📤 Please upload PDF files from the sidebar and click 'Process Documents'")
+else:
+    # Display chat history
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+    
+    # Chat input
+    if prompt := st.chat_input("Ask about your documents..."):
+        # Add user message
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        # Generate response
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                try:
+                    response = st.session_state.conversation.invoke({"question": prompt})
+                    answer = response["answer"]
+                    st.markdown(answer)
+                    st.session_state.messages.append({"role": "assistant", "content": answer})
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+                    st.info("Try reprocessing documents or check your API key.")
+
+# ============ FOOTER ============
+st.divider()
+st.caption("🔒 Documents are processed in-memory only | No data is stored permanently")
