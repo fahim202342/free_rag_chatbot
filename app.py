@@ -9,11 +9,10 @@ import gc
 
 from dotenv import load_dotenv
 
-# ========== FIXED IMPORTS ==========
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.document_loaders import PyMuPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter  # FIXED!
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.callbacks.base import BaseCallbackHandler
@@ -39,7 +38,7 @@ if not GROQ_API_KEY:
     st.error("❌ GROQ_API_KEY missing! Add to `.env` or Streamlit Secrets")
     st.stop()
 
-# ========== PATHS ==========
+# ========== PATHS (Streamlit Cloud safe) ==========
 CHROMA_DB_PATH = os.path.join(tempfile.gettempdir(), "chroma_db")
 META_FILE = os.path.join(tempfile.gettempdir(), "uploaded_files_meta.json")
 
@@ -57,7 +56,6 @@ def save_meta(meta):
 
 
 def safe_delete_db():
-    """Safely delete Chroma DB"""
     if not os.path.exists(CHROMA_DB_PATH):
         return True
     try:
@@ -70,7 +68,6 @@ def safe_delete_db():
     except Exception:
         pass
     time.sleep(0.5)
-    
     for _ in range(5):
         try:
             shutil.rmtree(CHROMA_DB_PATH)
@@ -94,7 +91,7 @@ uploaded_meta = load_meta()
 with st.sidebar:
     st.header("📤 Upload Documents")
     
-    # Mobile-friendly: separate upload from processing
+    # Step 1: Only select files (NO processing here!)
     uploaded_files = st.file_uploader(
         "Upload PDF files",
         type=["pdf"],
@@ -102,12 +99,15 @@ with st.sidebar:
         key=f"uploader_{st.session_state.upload_key}"
     )
     
-    # Store files in session state for processing
+    # Store files in session state for later processing
     if uploaded_files:
         st.session_state.pending_files = uploaded_files
         st.info(f"📎 {len(uploaded_files)} file(s) selected")
+        for f in uploaded_files:
+            st.caption(f"• {f.name} ({f.size/1024:.0f} KB)")
     
-    # PROCESS BUTTON - Critical for mobile!
+    # Step 2: PROCESS BUTTON - Critical for mobile!
+    # Processing only happens when user clicks this
     process_btn = st.button(
         "🚀 Process Documents", 
         type="primary",
@@ -115,11 +115,11 @@ with st.sidebar:
         disabled=not uploaded_files
     )
     
-    # Show processed files
+    # Show already processed files
     if uploaded_meta:
-        st.subheader("📁 Uploaded Files")
+        st.subheader("📁 Processed Files")
         for fname in uploaded_meta.values():
-            st.text(f"• {fname}")
+            st.text(f"✅ {fname}")
     
     # Clear button
     if st.button("🗑️ Clear All", use_container_width=True):
@@ -128,16 +128,28 @@ with st.sidebar:
             os.remove(META_FILE)
         st.session_state.processed = False
         st.session_state.upload_key += 1
+        st.session_state.pending_files = None
         st.cache_resource.clear()
         st.rerun()
 
 
-# ========== PROCESSING (Only when button clicked) ==========
-def process_with_gc(files, meta, embeddings, text_splitter):
-    """Process files with memory cleanup between each"""
-    new_files = []
-    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+# ========== PROCESSING FUNCTION (with memory cleanup) ==========
+def process_files_with_gc(files, meta):
+    """Process files one by one with garbage collection after each"""
     
+    # Initialize embeddings (once)
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={'device': 'cpu'}
+    )
+    
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=150
+    )
+    
+    # Initialize ChromaDB
+    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
     try:
         vectordb = Chroma(
             client=client,
@@ -145,7 +157,6 @@ def process_with_gc(files, meta, embeddings, text_splitter):
             collection_name="docs"
         )
     except Exception:
-        # Collection doesn't exist, create it
         vectordb = Chroma(
             client=client,
             embedding_function=embeddings,
@@ -155,39 +166,46 @@ def process_with_gc(files, meta, embeddings, text_splitter):
     
     progress = st.progress(0)
     status = st.empty()
+    new_files = []
     
     for i, file in enumerate(files):
-        status.text(f"Processing {i+1}/{len(files)}: {file.name}")
+        # Show progress
+        status.text(f"⏳ {i+1}/{len(files)}: {file.name}")
         
+        # Skip if already processed
         file_hash = hashlib.md5(file.getvalue()).hexdigest()
         if file_hash in meta:
             progress.progress((i + 1) / len(files))
             continue
         
-        # Write to temp file
+        # Save to temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(file.getvalue())
             tmp_path = tmp.name
         
         try:
-            # Load and split
+            # Load PDF
             loader = PyMuPDFLoader(tmp_path)
             docs = loader.load()
-            chunks = text_splitter.split_documents(docs)
             
+            # Split into chunks
+            chunks = text_splitter.split_documents(docs)
             for chunk in chunks:
                 chunk.metadata["source"] = file.name
             
             # Add to vector DB
             vectordb.add_documents(chunks)
+            
+            # Mark as processed
             meta[file_hash] = file.name
             new_files.append(file.name)
             
         except Exception as e:
-            st.error(f"❌ {file.name}: {e}")
+            st.error(f"❌ {file.name}: {str(e)}")
         finally:
+            # Clean up temp file
             os.unlink(tmp_path)
-            # CRITICAL: Free memory after each file
+            # CRITICAL: Free memory after EACH file (prevents mobile crash)
             gc.collect()
         
         progress.progress((i + 1) / len(files))
@@ -197,33 +215,26 @@ def process_with_gc(files, meta, embeddings, text_splitter):
     return new_files, meta
 
 
+# ========== HANDLE PROCESSING (only when button clicked) ==========
 if process_btn and st.session_state.pending_files:
-    with st.spinner("Initializing..."):
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={'device': 'cpu'}
-        )
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,  # Reduced for mobile
-            chunk_overlap=150
-        )
+    st.subheader("🔄 Processing...")
     
-    new_files, uploaded_meta = process_with_gc(
+    new_files, uploaded_meta = process_files_with_gc(
         st.session_state.pending_files,
-        uploaded_meta,
-        embeddings,
-        text_splitter
+        uploaded_meta
     )
     
     if new_files:
         save_meta(uploaded_meta)
-        st.success(f"✅ Done: {', '.join(new_files)}")
+        st.success(f"✅ Processed: {', '.join(new_files)}")
         st.session_state.processed = True
         st.session_state.pending_files = None
         st.cache_resource.clear()
+        st.balloons()
         st.rerun()
     else:
         st.info("ℹ️ All files already processed")
+        st.session_state.pending_files = None
 
 
 # ========== RETRIEVER ==========
