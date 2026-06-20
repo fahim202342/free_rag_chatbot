@@ -64,7 +64,6 @@ def safe_delete_chroma_db():
     if not os.path.exists(CHROMA_DB_PATH):
         return True
 
-    # Try to release any chroma connections
     try:
         client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
         try:
@@ -75,10 +74,8 @@ def safe_delete_chroma_db():
     except Exception:
         pass
 
-    # Wait a moment for file handles to release
     time.sleep(0.5)
 
-    # On Windows, we need to handle locked sqlite files
     max_retries = 5
     for attempt in range(max_retries):
         try:
@@ -88,7 +85,6 @@ def safe_delete_chroma_db():
             if attempt < max_retries - 1:
                 time.sleep(0.5)
             else:
-                # Force delete by renaming first (Windows workaround)
                 try:
                     temp_path = CHROMA_DB_PATH + "_old"
                     if os.path.exists(temp_path):
@@ -117,7 +113,6 @@ with st.sidebar:
         st.subheader("Processing...")
         embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 
-        # Initialize or load Chroma
         client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
         vectordb = Chroma(
             client=client,
@@ -145,7 +140,6 @@ with st.sidebar:
                 docs = loader.load()
                 chunks = text_splitter.split_documents(docs)
 
-                # Add source metadata
                 for chunk in chunks:
                     chunk.metadata["source"] = file.name
 
@@ -164,13 +158,11 @@ with st.sidebar:
         else:
             st.info("ℹ️ All files already uploaded.")
 
-    # Show uploaded files
     if uploaded_meta:
         st.subheader("📁 Uploaded Files")
         for fh, fname in uploaded_meta.items():
             st.text(f"• {fname}")
 
-    # Clear database option
     if st.button("🗑️ Clear All Documents", type="secondary"):
         success = safe_delete_chroma_db()
         if os.path.exists(META_FILE):
@@ -195,20 +187,22 @@ K_DOCS = 3
 
 
 @st.cache_resource(ttl="1h")
-def configure_retriever(csize, cover, k):
-    if os.path.exists(CHROMA_DB_PATH):
-        embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-        vectordb = Chroma(
-            client=client,
-            embedding_function=embeddings,
-            collection_name="docs"
-        )
-        return vectordb.as_retriever(search_kwargs={"k": k})
-    return None
+def configure_retriever(csize, cover, k, db_exists):
+    """Cache key includes db_exists so cache invalidates when DB state changes."""
+    if not db_exists:
+        return None
+    embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+    vectordb = Chroma(
+        client=client,
+        embedding_function=embeddings,
+        collection_name="docs"
+    )
+    return vectordb.as_retriever(search_kwargs={"k": k})
 
 
-retriever = configure_retriever(CHUNK_SIZE, CHUNK_OVERLAP, K_DOCS)
+db_exists = os.path.exists(CHROMA_DB_PATH)
+retriever = configure_retriever(CHUNK_SIZE, CHUNK_OVERLAP, K_DOCS, db_exists)
 
 if retriever is None:
     st.info("📤 No documents uploaded yet. Please upload PDF files from the sidebar.")
