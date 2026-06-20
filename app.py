@@ -2,7 +2,6 @@ import streamlit as st
 import os
 import tempfile
 import hashlib
-import re
 
 from dotenv import load_dotenv
 
@@ -13,7 +12,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
-from langchain_core.documents import Document
 from operator import itemgetter
 
 # ========== LOAD API KEYS FROM .ENV ==========
@@ -40,6 +38,8 @@ def init_session():
     defaults = {
         "uploaded_meta": {},
         "chunks": [],
+        "chunk_embeddings": [],
+        "embeddings": None,
         "has_docs": False,
     }
     for key, val in defaults.items():
@@ -118,6 +118,7 @@ with st.sidebar:
         st.session_state["uploaded_meta"] = {}
         st.session_state["chunks"] = []
         st.session_state["chunk_embeddings"] = []
+        st.session_state["embeddings"] = None
         st.session_state["has_docs"] = False
         st.success("Cleared!")
         st.rerun()
@@ -147,6 +148,9 @@ def retrieve_docs(query):
     embeddings = st.session_state["embeddings"]
     chunks = st.session_state["chunks"]
     chunk_embeddings = st.session_state["chunk_embeddings"]
+
+    if embeddings is None or not chunks or not chunk_embeddings:
+        return []
 
     query_emb = embeddings.embed_query(query)
 
