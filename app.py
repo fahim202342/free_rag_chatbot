@@ -1,5 +1,11 @@
-import streamlit as st
 import os
+import sys
+
+# FIX: Set protobuf to use pure Python implementation BEFORE any other imports
+# This prevents the TypeError: Descriptors cannot be created directly error
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
+import streamlit as st
 import tempfile
 import hashlib
 import json
@@ -297,7 +303,7 @@ class StreamHandler(BaseCallbackHandler):
 
 
 class PostMessageHandler(BaseCallbackHandler):
-    def __lit__(self, placeholder):
+    def __init__(self, placeholder):
         self.placeholder = placeholder
         self.sources = []
 
