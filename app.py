@@ -3,7 +3,6 @@ import os
 import tempfile
 import hashlib
 import json
-import shutil
 
 from dotenv import load_dotenv
 
@@ -14,8 +13,11 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
+from langchain_core.documents import Document
+from langchain_core.runnables import RunnableLambda
 from operator import itemgetter
 import pandas as pd
+import numpy as np
 
 # ========== LOAD API KEYS FROM .ENV ==========
 load_dotenv()
@@ -46,6 +48,9 @@ if "vectordb" not in st.session_state:
 if "has_docs" not in st.session_state:
     st.session_state["has_docs"] = False
 
+if "chunks" not in st.session_state:
+    st.session_state["chunks"] = []
+
 # ========== DOCUMENT UPLOAD SIDEBAR ==========
 with st.sidebar:
     st.header("📤 Upload Documents")
@@ -59,7 +64,6 @@ with st.sidebar:
     if uploaded_files:
         st.subheader("Processing...")
 
-        # Pure in-memory embeddings — no disk, no ChromaDB
         embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 
         text_splitter = RecursiveCharacterTextSplitter(
@@ -95,16 +99,17 @@ with st.sidebar:
                 os.unlink(tmp_path)
 
         if all_chunks:
-            # Try FAISS first (pure in-memory), fallback to simple list search
+            # Try FAISS first (pure in-memory)
             try:
                 from langchain_community.vectorstores import FAISS
                 vectordb = FAISS.from_documents(all_chunks, embeddings)
                 st.session_state["vectordb"] = vectordb
                 st.session_state["has_docs"] = True
+                st.session_state["use_faiss"] = True
                 st.success(f"✅ Uploaded: {', '.join(new_files)}")
                 st.rerun()
             except Exception as e:
-                # Fallback: store chunks and do simple similarity
+                # Fallback: simple similarity search
                 st.session_state["chunks"] = all_chunks
                 st.session_state["embeddings"] = embeddings
                 st.session_state["has_docs"] = True
@@ -142,27 +147,32 @@ if st.session_state.get("use_faiss", True) and st.session_state["vectordb"] is n
     retriever = st.session_state["vectordb"].as_retriever(search_kwargs={"k": K_DOCS})
 else:
     # Fallback: simple similarity search using embeddings
-    from langchain_core.documents import Document
     from sklearn.metrics.pairwise import cosine_similarity
-    import numpy as np
 
     class SimpleRetriever:
         def __init__(self, chunks, embeddings, k):
             self.chunks = chunks
             self.embeddings = embeddings
             self.k = k
-            # Pre-compute embeddings for all chunks
             texts = [c.page_content for c in chunks]
             self.chunk_embeddings = self.embeddings.embed_documents(texts)
 
-        def invoke(self, query):
+        def get_relevant_documents(self, query):
             query_emb = self.embeddings.embed_query(query)
             similarities = cosine_similarity([query_emb], self.chunk_embeddings)[0]
             top_k_idx = np.argsort(similarities)[::-1][:self.k]
-            return [self.chunks[i] for i in top_k_idx]
+            results = []
+            for i in top_k_idx:
+                doc = self.chunks[i]
+                # Ensure we return proper Document objects
+                if isinstance(doc, Document):
+                    results.append(doc)
+                else:
+                    results.append(Document(page_content=str(doc), metadata={}))
+            return results
 
-        def get_relevant_documents(self, query):
-            return self.invoke(query)
+        def invoke(self, query):
+            return self.get_relevant_documents(query)
 
     retriever = SimpleRetriever(
         st.session_state.get("chunks", []),
@@ -186,16 +196,26 @@ qa_prompt = ChatPromptTemplate.from_template(qa_template)
 
 
 def format_docs(docs):
+    if isinstance(docs, str):
+        return docs
     return "\n\n".join([d.page_content for d in docs])
 
 
-# Wrap retriever for LCEL compatibility
-from langchain_core.runnables import RunnableLambda
+def retrieve_docs(inputs):
+    """Retrieve documents and ensure we return a list of Document objects."""
+    query = inputs["question"]
+    if hasattr(retriever, "invoke"):
+        docs = retriever.invoke(query)
+    else:
+        docs = retriever.get_relevant_documents(query)
+    return docs
 
-retriever_runnable = RunnableLambda(lambda x: retriever.invoke(x["question"]) if hasattr(retriever, "invoke") else retriever.get_relevant_documents(x["question"]))
 
 qa_rag_chain = (
-    {"context": itemgetter("question") | retriever_runnable | format_docs, "question": itemgetter("question")}
+    {
+        "context": RunnableLambda(retrieve_docs) | format_docs,
+        "question": itemgetter("question")
+    }
     | qa_prompt
     | llm
 )
@@ -255,7 +275,7 @@ if user_prompt := st.chat_input("Ask a question..."):
         try:
             response = qa_rag_chain.invoke(
                 {"question": user_prompt},
-                {"callbacks": [stream_handler, pm_handler]}
+                config={"callbacks": [stream_handler, pm_handler]}
             )
         except Exception as e:
             st.error(f"Error: {e}")
