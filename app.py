@@ -2,7 +2,7 @@ import streamlit as st
 import os
 import tempfile
 import hashlib
-import json
+import re
 
 from dotenv import load_dotenv
 
@@ -14,10 +14,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
 from langchain_core.documents import Document
-from langchain_core.runnables import RunnableLambda
 from operator import itemgetter
-import pandas as pd
-import numpy as np
 
 # ========== LOAD API KEYS FROM .ENV ==========
 load_dotenv()
@@ -39,17 +36,17 @@ if not GROQ_API_KEY:
     st.stop()
 
 # ========== SESSION STATE INIT ==========
-if "uploaded_meta" not in st.session_state:
-    st.session_state["uploaded_meta"] = {}
+def init_session():
+    defaults = {
+        "uploaded_meta": {},
+        "chunks": [],
+        "has_docs": False,
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
 
-if "vectordb" not in st.session_state:
-    st.session_state["vectordb"] = None
-
-if "has_docs" not in st.session_state:
-    st.session_state["has_docs"] = False
-
-if "chunks" not in st.session_state:
-    st.session_state["chunks"] = []
+init_session()
 
 # ========== DOCUMENT UPLOAD SIDEBAR ==========
 with st.sidebar:
@@ -99,23 +96,16 @@ with st.sidebar:
                 os.unlink(tmp_path)
 
         if all_chunks:
-            # Try FAISS first (pure in-memory)
-            try:
-                from langchain_community.vectorstores import FAISS
-                vectordb = FAISS.from_documents(all_chunks, embeddings)
-                st.session_state["vectordb"] = vectordb
-                st.session_state["has_docs"] = True
-                st.session_state["use_faiss"] = True
-                st.success(f"✅ Uploaded: {', '.join(new_files)}")
-                st.rerun()
-            except Exception as e:
-                # Fallback: simple similarity search
-                st.session_state["chunks"] = all_chunks
-                st.session_state["embeddings"] = embeddings
-                st.session_state["has_docs"] = True
-                st.session_state["use_faiss"] = False
-                st.success(f"✅ Uploaded: {', '.join(new_files)} (fallback mode)")
-                st.rerun()
+            # Embed all chunks
+            texts = [c.page_content for c in all_chunks]
+            chunk_embeddings = embeddings.embed_documents(texts)
+
+            st.session_state["chunks"] = all_chunks
+            st.session_state["chunk_embeddings"] = chunk_embeddings
+            st.session_state["embeddings"] = embeddings
+            st.session_state["has_docs"] = True
+            st.success(f"✅ Uploaded: {', '.join(new_files)}")
+            st.rerun()
         else:
             st.info("ℹ️ All files already uploaded.")
 
@@ -126,10 +116,9 @@ with st.sidebar:
 
     if st.button("🗑️ Clear All Documents", type="secondary"):
         st.session_state["uploaded_meta"] = {}
-        st.session_state["vectordb"] = None
-        st.session_state["has_docs"] = False
         st.session_state["chunks"] = []
-        st.session_state["use_faiss"] = True
+        st.session_state["chunk_embeddings"] = []
+        st.session_state["has_docs"] = False
         st.success("Cleared!")
         st.rerun()
 
@@ -142,43 +131,37 @@ if not st.session_state["has_docs"]:
     st.info("📤 No documents uploaded yet. Please upload PDF files from the sidebar.")
     st.stop()
 
-# Build retriever from session state
-if st.session_state.get("use_faiss", True) and st.session_state["vectordb"] is not None:
-    retriever = st.session_state["vectordb"].as_retriever(search_kwargs={"k": K_DOCS})
-else:
-    # Fallback: simple similarity search using embeddings
-    from sklearn.metrics.pairwise import cosine_similarity
+# Simple cosine similarity using pure Python
+def cosine_similarity(a, b):
+    """Compute cosine similarity between two vectors."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
-    class SimpleRetriever:
-        def __init__(self, chunks, embeddings, k):
-            self.chunks = chunks
-            self.embeddings = embeddings
-            self.k = k
-            texts = [c.page_content for c in chunks]
-            self.chunk_embeddings = self.embeddings.embed_documents(texts)
 
-        def get_relevant_documents(self, query):
-            query_emb = self.embeddings.embed_query(query)
-            similarities = cosine_similarity([query_emb], self.chunk_embeddings)[0]
-            top_k_idx = np.argsort(similarities)[::-1][:self.k]
-            results = []
-            for i in top_k_idx:
-                doc = self.chunks[i]
-                # Ensure we return proper Document objects
-                if isinstance(doc, Document):
-                    results.append(doc)
-                else:
-                    results.append(Document(page_content=str(doc), metadata={}))
-            return results
+def retrieve_docs(query):
+    """Retrieve top-k similar chunks using pure Python cosine similarity."""
+    embeddings = st.session_state["embeddings"]
+    chunks = st.session_state["chunks"]
+    chunk_embeddings = st.session_state["chunk_embeddings"]
 
-        def invoke(self, query):
-            return self.get_relevant_documents(query)
+    query_emb = embeddings.embed_query(query)
 
-    retriever = SimpleRetriever(
-        st.session_state.get("chunks", []),
-        st.session_state.get("embeddings"),
-        K_DOCS
-    )
+    scores = []
+    for emb in chunk_embeddings:
+        sim = cosine_similarity(query_emb, emb)
+        scores.append(sim)
+
+    # Get top K indices
+    indexed_scores = list(enumerate(scores))
+    indexed_scores.sort(key=lambda x: x[1], reverse=True)
+    top_k = indexed_scores[:K_DOCS]
+
+    return [chunks[i] for i, _ in top_k]
+
 
 # ========== LLM & CHAIN ==========
 llm = ChatGroq(model_name=MODEL, temperature=TEMP, streaming=True)
@@ -196,24 +179,17 @@ qa_prompt = ChatPromptTemplate.from_template(qa_template)
 
 
 def format_docs(docs):
-    if isinstance(docs, str):
-        return docs
     return "\n\n".join([d.page_content for d in docs])
 
 
-def retrieve_docs(inputs):
-    """Retrieve documents and ensure we return a list of Document objects."""
-    query = inputs["question"]
-    if hasattr(retriever, "invoke"):
-        docs = retriever.invoke(query)
-    else:
-        docs = retriever.get_relevant_documents(query)
-    return docs
+def build_context(inputs):
+    docs = retrieve_docs(inputs["question"])
+    return format_docs(docs)
 
 
 qa_rag_chain = (
     {
-        "context": RunnableLambda(retrieve_docs) | format_docs,
+        "context": build_context,
         "question": itemgetter("question")
     }
     | qa_prompt
@@ -252,6 +228,7 @@ class PostMessageHandler(BaseCallbackHandler):
             with self.placeholder.container():
                 st.markdown("---")
                 st.markdown("**Sources:**")
+                import pandas as pd
                 st.dataframe(pd.DataFrame(self.sources[:3]), width=1000)
 
 
