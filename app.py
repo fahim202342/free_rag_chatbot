@@ -1,21 +1,14 @@
-import os
-import sys
-
-# FIX: Protobuf version conflict — MUST be before any other imports
-os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
-
 import streamlit as st
+import os
 import tempfile
 import hashlib
 import json
 import shutil
 import time
-import warnings
-
-warnings.filterwarnings("ignore")
 
 from dotenv import load_dotenv
 
+# Fix imports for newer langchain versions
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.document_loaders import PyMuPDFLoader
@@ -24,16 +17,16 @@ from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
-from langchain_core.documents import Document
-from langchain_core.retrievers import BaseRetriever
 from operator import itemgetter
 import pandas as pd
+import chromadb
 
 
-# ========== LOAD API KEYS ==========
+# ========== LOAD API KEYS FROM .ENV ==========
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN", "")
 
 if GROQ_API_KEY:
     os.environ["GROQ_API_KEY"] = GROQ_API_KEY
@@ -41,49 +34,40 @@ if GROQ_API_KEY:
 # ========== PAGE SETUP ==========
 st.set_page_config(page_title="Free RAG Chatbot", page_icon="🤖")
 
+# ========== NORMAL USER CHAT INTERFACE ==========
 st.title("🤖 Free RAG Chatbot")
-st.caption("100% Free | Powered by Groq + ChromaDB")
+st.caption("100% Free")
 
 # ========== API CHECK ==========
 if not GROQ_API_KEY:
-    st.error("❌ GROQ_API_KEY missing!")
-    st.info("Add it in Streamlit Cloud: Settings → Secrets")
-    st.code('GROQ_API_KEY = "gsk_xxxxxxxxxxxxxxxxxxxx"', language="toml")
+    st.error("❌ GROQ_API_KEY missing! Create a `.env` file with GROQ_API_KEY=your_key")
     st.stop()
 
-# ========== PATHS ==========
-CHROMA_DB_PATH = os.path.abspath("./chroma_db")
-META_FILE = os.path.abspath("./uploaded_files_meta.json")
+# ========== PERSISTENT STORAGE SETUP ==========
+CHROMA_DB_PATH = "./chroma_db"
+META_FILE = "./uploaded_files_meta.json"
 
 
 def load_uploaded_meta():
-    """Load uploaded files metadata safely."""
     if os.path.exists(META_FILE):
-        try:
-            with open(META_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        with open(META_FILE, "r") as f:
+            return json.load(f)
     return {}
 
 
 def save_uploaded_meta(meta):
-    """Save uploaded files metadata safely."""
-    try:
-        with open(META_FILE, "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        st.error(f"Failed to save meta: {e}")
+    with open(META_FILE, "w") as f:
+        json.dump(meta, f)
 
 
 def safe_delete_chroma_db():
-    """Safely delete Chroma DB."""
+    """Safely delete Chroma DB by releasing file locks first."""
     if not os.path.exists(CHROMA_DB_PATH):
         return True
 
-    # Try to delete collection first
+    # Try to release any chroma connections
     try:
-        import chromadb
+        # Create a client and delete the collection first
         client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
         try:
             client.delete_collection("docs")
@@ -93,185 +77,136 @@ def safe_delete_chroma_db():
     except Exception:
         pass
 
-    time.sleep(0.3)
+    # Wait a moment for file handles to release
+    time.sleep(0.5)
 
-    # Try deleting folder
-    for attempt in range(5):
+    # On Windows, we need to handle locked sqlite files
+    max_retries = 5
+    for attempt in range(max_retries):
         try:
-            shutil.rmtree(CHROMA_DB_PATH, ignore_errors=True)
-            if not os.path.exists(CHROMA_DB_PATH):
-                return True
-        except Exception:
-            time.sleep(0.3)
+            shutil.rmtree(CHROMA_DB_PATH)
+            return True
+        except PermissionError:
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+            else:
+                # Force delete by renaming first (Windows workaround)
+                try:
+                    temp_path = CHROMA_DB_PATH + "_old"
+                    if os.path.exists(temp_path):
+                        shutil.rmtree(temp_path)
+                    os.rename(CHROMA_DB_PATH, temp_path)
+                    # Try to delete the renamed folder
+                    shutil.rmtree(temp_path, ignore_errors=True)
+                    return True
+                except Exception:
+                    return False
+    return False
 
-    # Rename and delete as last resort
-    try:
-        temp_path = CHROMA_DB_PATH + "_old_" + str(int(time.time()))
-        os.rename(CHROMA_DB_PATH, temp_path)
-        shutil.rmtree(temp_path, ignore_errors=True)
-        return True
-    except Exception:
-        return False
 
-
-# ========== SIDEBAR ==========
 uploaded_meta = load_uploaded_meta()
 
+# ========== DOCUMENT UPLOAD SIDEBAR ==========
 with st.sidebar:
     st.header("📤 Upload Documents")
-
     uploaded_files = st.file_uploader(
-        "Upload PDF or JSON",
-        type=["pdf", "json"],
+        "Upload PDF files",
+        type=["pdf"],
         accept_multiple_files=True,
-        key="doc_uploader"
+        key="pdf_uploader"
     )
 
-    # Process uploads
     if uploaded_files:
-        process_btn = st.button("🚀 Process Files", type="primary", use_container_width=True)
+        st.subheader("Processing...")
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
 
-        if process_btn:
-            with st.spinner("Loading embedding model..."):
-                try:
-                    embeddings = HuggingFaceEmbeddings(
-                        model_name="sentence-transformers/all-MiniLM-L6-v2",
-                        model_kwargs={"device": "cpu"},
-                        encode_kwargs={"normalize_embeddings": True}
-                    )
-                except Exception as e:
-                    st.error(f"❌ Embedding model failed: {e}")
-                    st.stop()
+        # Initialize or load Chroma
+        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+        vectordb = Chroma(
+            client=client,
+            embedding_function=embeddings,
+            collection_name="docs"
+        )
 
-            with st.spinner("Connecting to ChromaDB..."):
-                try:
-                    import chromadb
-                    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-                    vectordb = Chroma(
-                        client=client,
-                        embedding_function=embeddings,
-                        collection_name="docs"
-                    )
-                except Exception as e:
-                    st.error(f"❌ ChromaDB failed: {e}")
-                    st.stop()
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1500,
+            chunk_overlap=200
+        )
 
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1500,
-                chunk_overlap=200
-            )
+        new_files = []
+        for file in uploaded_files:
+            file_hash = hashlib.md5(file.getvalue()).hexdigest()
+            if file_hash in uploaded_meta:
+                continue
 
-            new_files = []
-            progress_bar = st.progress(0)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(file.getvalue())
+                tmp_path = tmp.name
 
-            for idx, file in enumerate(uploaded_files):
-                progress_bar.progress((idx) / len(uploaded_files))
+            try:
+                loader = PyMuPDFLoader(tmp_path)
+                docs = loader.load()
+                chunks = text_splitter.split_documents(docs)
 
-                file_hash = hashlib.md5(file.getvalue()).hexdigest()
-                if file_hash in uploaded_meta:
-                    continue
+                # Add source metadata
+                for chunk in chunks:
+                    chunk.metadata["source"] = file.name
 
-                file_ext = os.path.splitext(file.name)[1].lower()
+                vectordb.add_documents(chunks)
+                uploaded_meta[file_hash] = file.name
+                new_files.append(file.name)
+            except Exception as e:
+                st.error(f"Error processing {file.name}: {e}")
+            finally:
+                os.unlink(tmp_path)
 
-                with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
-                    tmp.write(file.getvalue())
-                    tmp_path = tmp.name
-
-                try:
-                    if file_ext == ".pdf":
-                        loader = PyMuPDFLoader(tmp_path)
-                        docs = loader.load()
-                    elif file_ext == ".json":
-                        with open(tmp_path, "r", encoding="utf-8") as jf:
-                            data = json.load(jf)
-                        if isinstance(data, list):
-                            text_content = "\n\n".join(
-                                [json.dumps(item, ensure_ascii=False) for item in data]
-                            )
-                        else:
-                            text_content = json.dumps(data, ensure_ascii=False)
-                        docs = [Document(
-                            page_content=text_content,
-                            metadata={"source": file.name, "page": 1}
-                        )]
-                    else:
-                        docs = []
-
-                    if not docs:
-                        st.warning(f"⚠️ Empty: {file.name}")
-                        continue
-
-                    chunks = text_splitter.split_documents(docs)
-                    for chunk in chunks:
-                        chunk.metadata["source"] = file.name
-
-                    vectordb.add_documents(chunks)
-                    uploaded_meta[file_hash] = file.name
-                    new_files.append(file.name)
-
-                except Exception as e:
-                    st.error(f"❌ Failed {file.name}: {e}")
-                finally:
-                    try:
-                        os.unlink(tmp_path)
-                    except Exception:
-                        pass
-
-            progress_bar.empty()
-
-            if new_files:
-                save_uploaded_meta(uploaded_meta)
-                st.success(f"✅ Done: {', '.join(new_files)}")
-                st.cache_resource.clear()
-                time.sleep(1)
-                st.rerun()
-            else:
-                st.info("ℹ️ All files already uploaded or empty.")
+        if new_files:
+            save_uploaded_meta(uploaded_meta)
+            st.success(f"✅ Uploaded: {', '.join(new_files)}")
+            st.rerun()
+        else:
+            st.info("ℹ️ All files already uploaded.")
 
     # Show uploaded files
     if uploaded_meta:
-        st.subheader("📁 Files")
-        for fh, fname in list(uploaded_meta.items())[:20]:
+        st.subheader("📁 Uploaded Files")
+        for fh, fname in uploaded_meta.items():
             st.text(f"• {fname}")
-        if len(uploaded_meta) > 20:
-            st.text(f"... and {len(uploaded_meta) - 20} more")
 
-    # Clear button
-    if st.button("🗑️ Clear All", type="secondary", use_container_width=True):
-        with st.spinner("Clearing..."):
-            success = safe_delete_chroma_db()
-            if os.path.exists(META_FILE):
-                try:
-                    os.remove(META_FILE)
-                except Exception:
-                    pass
-            st.cache_resource.clear()
+    # Clear database option
+    if st.button("🗑️ Clear All Documents", type="secondary"):
+        success = safe_delete_chroma_db()
+        if os.path.exists(META_FILE):
+            try:
+                os.remove(META_FILE)
+            except Exception:
+                pass
 
         if success:
-            st.success("Cleared!")
+            st.success("Database cleared!")
         else:
-            st.warning("⚠️ Partially cleared. Restart app if needed.")
-        time.sleep(1)
+            st.warning("⚠️ Could not fully clear DB. Please restart the app and try again.")
+
+        # Clear cache to force retriever recreation
+        st.cache_resource.clear()
         st.rerun()
 
 # ========== RETRIEVER ==========
 MODEL = "llama-3.3-70b-versatile"
 TEMP = 0.1
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 200
 K_DOCS = 3
 
 
 @st.cache_resource(ttl="1h")
-def get_retriever(k):
-    """Get retriever from existing ChromaDB."""
-    if not os.path.exists(CHROMA_DB_PATH):
-        return None
-    try:
+def configure_retriever(csize, cover, k):
+    if os.path.exists(CHROMA_DB_PATH):
         embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True}
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
-        import chromadb
         client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
         vectordb = Chroma(
             client=client,
@@ -279,38 +214,18 @@ def get_retriever(k):
             collection_name="docs"
         )
         return vectordb.as_retriever(search_kwargs={"k": k})
-    except Exception as e:
-        st.error(f"Retriever error: {e}")
-        return None
+    return None
 
 
-retriever = get_retriever(K_DOCS)
-has_docs = retriever is not None
-
-if not has_docs:
-    st.info("📤 Upload PDF/JSON from sidebar to start chatting.")
-
-# Dummy retriever for when no docs exist
-class DummyRetriever(BaseRetriever):
-    def _get_relevant_documents(self, query):
-        return []
+retriever = configure_retriever(CHUNK_SIZE, CHUNK_OVERLAP, K_DOCS)
 
 if retriever is None:
-    retriever = DummyRetriever()
-
-# ========== LLM ==========
-try:
-    llm = ChatGroq(
-        model_name=MODEL,
-        temperature=TEMP,
-        streaming=True,
-        api_key=GROQ_API_KEY
-    )
-except Exception as e:
-    st.error(f"❌ LLM failed: {e}")
+    st.info("📤 No documents uploaded yet. Please upload PDF files from the sidebar.")
     st.stop()
 
-# ========== PROMPT & CHAIN ==========
+# ========== LLM & CHAIN ==========
+llm = ChatGroq(model_name=MODEL, temperature=TEMP, streaming=True)
+
 qa_template = """You are a helpful AI assistant. Use ONLY the following context to answer the question. If the answer is not in the context, say you do not have enough information.
 
 Context:
@@ -324,21 +239,19 @@ qa_prompt = ChatPromptTemplate.from_template(qa_template)
 
 
 def format_docs(docs):
-    if not docs:
-        return "[No documents available. Please upload files from the sidebar.]"
     return "\n\n".join([d.page_content for d in docs])
 
 
 qa_rag_chain = (
-    {
-        "context": itemgetter("question") | retriever | format_docs,
-        "question": itemgetter("question")
-    }
+    {"context": itemgetter("question") | retriever |
+     format_docs, "question": itemgetter("question")}
     | qa_prompt
     | llm
 )
 
-# ========== HANDLERS ==========
+# ========== STREAM HANDLER ==========
+
+
 class StreamHandler(BaseCallbackHandler):
     def __init__(self, container):
         self.container = container
@@ -355,12 +268,11 @@ class PostMessageHandler(BaseCallbackHandler):
         self.sources = []
 
     def on_retriever_end(self, documents, **kwargs):
-        self.sources = []
         for d in documents:
             meta = {
                 "source": d.metadata.get("source", "Unknown"),
                 "page": d.metadata.get("page", "N/A"),
-                "content": d.page_content[:300]
+                "content": d.page_content[:200]
             }
             self.sources.append(meta)
 
@@ -368,41 +280,31 @@ class PostMessageHandler(BaseCallbackHandler):
         if self.sources:
             with self.placeholder.container():
                 st.markdown("---")
-                st.markdown("**📚 Sources:**")
-                st.dataframe(
-                    pd.DataFrame(self.sources[:K_DOCS]),
-                    use_container_width=True,
-                    hide_index=True
-                )
+                st.markdown("**Sources:**")
+                st.dataframe(pd.DataFrame(self.sources[:3]), width=1000)
 
 
-# ========== CHAT UI ==========
-history = StreamlitChatMessageHistory(key="chat_history")
+# ========== CHAT ==========
+history = StreamlitChatMessageHistory(key="langchain_messages")
 
 if len(history.messages) == 0:
-    history.add_ai_message("Hello! 👋 Upload PDF or JSON files from the sidebar, then ask me anything about them.")
+    history.add_ai_message("Hello! Ask me anything about your documents.")
 
 for msg in history.messages:
     st.chat_message(msg.type).write(msg.content)
 
-# Chat input — always visible
-user_prompt = st.chat_input("Ask a question...", key="chat_input")
-
-if user_prompt:
+if user_prompt := st.chat_input("Ask a question..."):
     st.chat_message("human").write(user_prompt)
 
     with st.chat_message("ai"):
-        stream_container = st.empty()
+        stream_handler = StreamHandler(st.empty())
         sources_placeholder = st.empty()
-
-        stream_handler = StreamHandler(stream_container)
         pm_handler = PostMessageHandler(sources_placeholder)
 
         try:
-            with st.spinner("Thinking..."):
-                response = qa_rag_chain.invoke(
-                    {"question": user_prompt},
-                    config={"callbacks": [stream_handler, pm_handler]}
-                )
+            response = qa_rag_chain.invoke(
+                {"question": user_prompt},
+                {"callbacks": [stream_handler, pm_handler]}
+            )
         except Exception as e:
-            st.error(f"❌ Error: {e}")
+            st.error(f"Error: {e}")
