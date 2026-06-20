@@ -8,7 +8,6 @@ import time
 
 from dotenv import load_dotenv
 
-# Fix imports for newer langchain versions
 from langchain_groq import ChatGroq
 from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_community.document_loaders import PyMuPDFLoader
@@ -19,7 +18,6 @@ from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
 from operator import itemgetter
 import pandas as pd
-import chromadb
 
 
 # ========== LOAD API KEYS FROM .ENV ==========
@@ -33,7 +31,6 @@ if GROQ_API_KEY:
 # ========== PAGE SETUP ==========
 st.set_page_config(page_title="Free RAG Chatbot", page_icon="🤖")
 
-# ========== NORMAL USER CHAT INTERFACE ==========
 st.title("🤖 Free RAG Chatbot")
 st.caption("100% Free")
 
@@ -45,6 +42,7 @@ if not GROQ_API_KEY:
 # ========== PERSISTENT STORAGE SETUP ==========
 CHROMA_DB_PATH = "./chroma_db"
 META_FILE = "./uploaded_files_meta.json"
+COLLECTION_NAME = "rag_docs_v2"
 
 
 def load_uploaded_meta():
@@ -60,20 +58,11 @@ def save_uploaded_meta(meta):
 
 
 def safe_delete_chroma_db():
-    """Safely delete Chroma DB by releasing file locks first."""
+    """Safely delete Chroma DB."""
     if not os.path.exists(CHROMA_DB_PATH):
         return True
 
-    try:
-        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-        try:
-            client.delete_collection("docs")
-        except Exception:
-            pass
-        del client
-    except Exception:
-        pass
-
+    # Wait for file handles to release
     time.sleep(0.5)
 
     max_retries = 5
@@ -97,6 +86,23 @@ def safe_delete_chroma_db():
     return False
 
 
+# Auto-clean corrupted DB on startup
+if os.path.exists(CHROMA_DB_PATH):
+    try:
+        # Try to initialize - if it fails, delete corrupted DB
+        test_db = Chroma(
+            persist_directory=CHROMA_DB_PATH,
+            embedding_function=FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5"),
+            collection_name=COLLECTION_NAME
+        )
+        _ = test_db._collection.count()
+    except Exception:
+        # Corrupted DB - delete and start fresh
+        shutil.rmtree(CHROMA_DB_PATH, ignore_errors=True)
+        if os.path.exists(META_FILE):
+            os.remove(META_FILE)
+
+
 uploaded_meta = load_uploaded_meta()
 
 # ========== DOCUMENT UPLOAD SIDEBAR ==========
@@ -113,11 +119,11 @@ with st.sidebar:
         st.subheader("Processing...")
         embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 
-        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+        # Use langchain_chroma.Chroma with persist_directory
         vectordb = Chroma(
-            client=client,
+            persist_directory=CHROMA_DB_PATH,
             embedding_function=embeddings,
-            collection_name="docs"
+            collection_name=COLLECTION_NAME
         )
 
         text_splitter = RecursiveCharacterTextSplitter(
@@ -181,28 +187,24 @@ with st.sidebar:
 # ========== RETRIEVER ==========
 MODEL = "llama-3.3-70b-versatile"
 TEMP = 0.1
-CHUNK_SIZE = 1500
-CHUNK_OVERLAP = 200
 K_DOCS = 3
 
 
 @st.cache_resource(ttl="1h")
-def configure_retriever(csize, cover, k, db_exists):
-    """Cache key includes db_exists so cache invalidates when DB state changes."""
+def configure_retriever(k, db_exists):
     if not db_exists:
         return None
     embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-    client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
     vectordb = Chroma(
-        client=client,
+        persist_directory=CHROMA_DB_PATH,
         embedding_function=embeddings,
-        collection_name="docs"
+        collection_name=COLLECTION_NAME
     )
     return vectordb.as_retriever(search_kwargs={"k": k})
 
 
 db_exists = os.path.exists(CHROMA_DB_PATH)
-retriever = configure_retriever(CHUNK_SIZE, CHUNK_OVERLAP, K_DOCS, db_exists)
+retriever = configure_retriever(K_DOCS, db_exists)
 
 if retriever is None:
     st.info("📤 No documents uploaded yet. Please upload PDF files from the sidebar.")
