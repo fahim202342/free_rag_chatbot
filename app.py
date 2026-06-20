@@ -43,7 +43,7 @@ if not GROQ_API_KEY:
 # ========== PERSISTENT STORAGE SETUP ==========
 CHROMA_DB_PATH = "./chroma_db"
 META_FILE = "./uploaded_files_meta.json"
-COLLECTION_NAME = "rag_docs_v2"
+COLLECTION_NAME = "rag_docs_v3"
 
 
 def load_uploaded_meta():
@@ -86,19 +86,17 @@ def safe_delete_chroma_db():
     return False
 
 
-# ========== AUTO-CLEAN CORRUPTED DB ON STARTUP ==========
-def reset_db_state():
-    """Delete DB and meta to force a clean start."""
-    safe_delete_chroma_db()
-    if os.path.exists(META_FILE):
-        try:
-            os.remove(META_FILE)
-        except Exception:
-            pass
+# ========== AGGRESSIVE DB CLEANUP ==========
+# Delete EVERYTHING chroma-related on startup to avoid schema conflicts
+for p in [CHROMA_DB_PATH, CHROMA_DB_PATH + "_old", "./.chroma"]:
+    if os.path.exists(p):
+        shutil.rmtree(p, ignore_errors=True)
 
-
-# Always start fresh — no corrupted DB issues ever
-reset_db_state()
+if os.path.exists(META_FILE):
+    try:
+        os.remove(META_FILE)
+    except Exception:
+        pass
 
 uploaded_meta = load_uploaded_meta()
 
@@ -114,12 +112,11 @@ with st.sidebar:
 
     if uploaded_files:
         st.subheader("Processing...")
-        embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 
-        vectordb = Chroma.from_documents(
-            documents=[],
-            embedding=embeddings,
-            persist_directory=CHROMA_DB_PATH,
+        # Use in-memory Chroma — no persistence, no corruption
+        embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+        vectordb = Chroma(
+            embedding_function=embeddings,
             collection_name=COLLECTION_NAME
         )
 
@@ -129,6 +126,7 @@ with st.sidebar:
         )
 
         new_files = []
+        all_chunks = []
         for file in uploaded_files:
             file_hash = hashlib.md5(file.getvalue()).hexdigest()
             if file_hash in uploaded_meta:
@@ -146,7 +144,7 @@ with st.sidebar:
                 for chunk in chunks:
                     chunk.metadata["source"] = file.name
 
-                vectordb.add_documents(chunks)
+                all_chunks.extend(chunks)
                 uploaded_meta[file_hash] = file.name
                 new_files.append(file.name)
             except Exception as e:
@@ -154,12 +152,17 @@ with st.sidebar:
             finally:
                 os.unlink(tmp_path)
 
-        if new_files:
+        if all_chunks:
+            vectordb.add_documents(all_chunks)
             save_uploaded_meta(uploaded_meta)
             st.success(f"✅ Uploaded: {', '.join(new_files)}")
-            st.rerun()
-        else:
-            st.info("ℹ️ All files already uploaded.")
+
+        # Save vectordb to session state so retriever can use it
+        st.session_state["vectordb"] = vectordb
+        st.session_state["has_docs"] = True
+        st.rerun()
+    else:
+        st.session_state["has_docs"] = False
 
     if uploaded_meta:
         st.subheader("📁 Uploaded Files")
@@ -167,7 +170,14 @@ with st.sidebar:
             st.text(f"• {fname}")
 
     if st.button("🗑️ Clear All Documents", type="secondary"):
-        reset_db_state()
+        st.session_state["vectordb"] = None
+        st.session_state["has_docs"] = False
+        safe_delete_chroma_db()
+        if os.path.exists(META_FILE):
+            try:
+                os.remove(META_FILE)
+            except Exception:
+                pass
         st.success("Database cleared!")
         st.rerun()
 
@@ -177,25 +187,15 @@ TEMP = 0.1
 K_DOCS = 3
 
 
-@st.cache_resource(ttl="1h")
-def configure_retriever(k, db_exists):
-    if not db_exists:
-        return None
-    embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-    vectordb = Chroma(
-        persist_directory=CHROMA_DB_PATH,
-        embedding_function=embeddings,
-        collection_name=COLLECTION_NAME
-    )
-    return vectordb.as_retriever(search_kwargs={"k": k})
+# Get vectordb from session state
+vectordb = st.session_state.get("vectordb", None)
+has_docs = st.session_state.get("has_docs", False)
 
-
-db_exists = os.path.exists(CHROMA_DB_PATH)
-retriever = configure_retriever(K_DOCS, db_exists)
-
-if retriever is None:
+if not has_docs or vectordb is None:
     st.info("📤 No documents uploaded yet. Please upload PDF files from the sidebar.")
     st.stop()
+
+retriever = vectordb.as_retriever(search_kwargs={"k": K_DOCS})
 
 # ========== LLM & CHAIN ==========
 llm = ChatGroq(model_name=MODEL, temperature=TEMP, streaming=True)
