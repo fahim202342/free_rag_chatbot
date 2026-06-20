@@ -1,5 +1,11 @@
-import streamlit as st
 import os
+import sys
+
+# FIX: Protobuf version conflict fix — use pure Python implementation
+# Must be set BEFORE any imports that use protobuf (like chromadb)
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
+import streamlit as st
 import tempfile
 import hashlib
 import json
@@ -17,6 +23,8 @@ from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
+from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
 from operator import itemgetter
 import pandas as pd
 import chromadb
@@ -26,7 +34,6 @@ import chromadb
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN", "")
 
 if GROQ_API_KEY:
     os.environ["GROQ_API_KEY"] = GROQ_API_KEY
@@ -40,7 +47,8 @@ st.caption("100% Free")
 
 # ========== API CHECK ==========
 if not GROQ_API_KEY:
-    st.error("❌ GROQ_API_KEY missing! Create a `.env` file with GROQ_API_KEY=your_key")
+    st.error("❌ GROQ_API_KEY missing! Add it in Streamlit Secrets (Settings → Secrets)")
+    st.info("Format: GROQ_API_KEY = \"gsk_xxxxxxxxxxxxxxxxxxxx\"")
     st.stop()
 
 # ========== PERSISTENT STORAGE SETUP ==========
@@ -50,14 +58,20 @@ META_FILE = "./uploaded_files_meta.json"
 
 def load_uploaded_meta():
     if os.path.exists(META_FILE):
-        with open(META_FILE, "r") as f:
-            return json.load(f)
+        try:
+            with open(META_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, Exception):
+            return {}
     return {}
 
 
 def save_uploaded_meta(meta):
-    with open(META_FILE, "w") as f:
-        json.dump(meta, f)
+    try:
+        with open(META_FILE, "w") as f:
+            json.dump(meta, f)
+    except Exception:
+        pass
 
 
 def safe_delete_chroma_db():
@@ -65,9 +79,7 @@ def safe_delete_chroma_db():
     if not os.path.exists(CHROMA_DB_PATH):
         return True
 
-    # Try to release any chroma connections
     try:
-        # Create a client and delete the collection first
         client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
         try:
             client.delete_collection("docs")
@@ -77,10 +89,8 @@ def safe_delete_chroma_db():
     except Exception:
         pass
 
-    # Wait a moment for file handles to release
     time.sleep(0.5)
 
-    # On Windows, we need to handle locked sqlite files
     max_retries = 5
     for attempt in range(max_retries):
         try:
@@ -90,13 +100,11 @@ def safe_delete_chroma_db():
             if attempt < max_retries - 1:
                 time.sleep(0.5)
             else:
-                # Force delete by renaming first (Windows workaround)
                 try:
                     temp_path = CHROMA_DB_PATH + "_old"
                     if os.path.exists(temp_path):
                         shutil.rmtree(temp_path)
                     os.rename(CHROMA_DB_PATH, temp_path)
-                    # Try to delete the renamed folder
                     shutil.rmtree(temp_path, ignore_errors=True)
                     return True
                 except Exception:
@@ -110,25 +118,32 @@ uploaded_meta = load_uploaded_meta()
 with st.sidebar:
     st.header("📤 Upload Documents")
     uploaded_files = st.file_uploader(
-        "Upload PDF files",
-        type=["pdf"],
+        "Upload PDF or JSON files",
+        type=["pdf", "json"],
         accept_multiple_files=True,
         key="pdf_uploader"
     )
 
     if uploaded_files:
         st.subheader("Processing...")
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
+        try:
+            embeddings = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/all-MiniLM-L6-v2"
+            )
+        except Exception as e:
+            st.error(f"❌ Embedding model load failed: {e}")
+            st.stop()
 
-        # Initialize or load Chroma
-        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-        vectordb = Chroma(
-            client=client,
-            embedding_function=embeddings,
-            collection_name="docs"
-        )
+        try:
+            client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+            vectordb = Chroma(
+                client=client,
+                embedding_function=embeddings,
+                collection_name="docs"
+            )
+        except Exception as e:
+            st.error(f"❌ Chroma DB init failed: {e}")
+            st.stop()
 
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1500,
@@ -141,16 +156,32 @@ with st.sidebar:
             if file_hash in uploaded_meta:
                 continue
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            file_ext = os.path.splitext(file.name)[1].lower()
+            with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
                 tmp.write(file.getvalue())
                 tmp_path = tmp.name
 
             try:
-                loader = PyMuPDFLoader(tmp_path)
-                docs = loader.load()
+                if file_ext == ".pdf":
+                    loader = PyMuPDFLoader(tmp_path)
+                    docs = loader.load()
+                elif file_ext == ".json":
+                    with open(tmp_path, "r", encoding="utf-8") as jf:
+                        data = json.load(jf)
+                    if isinstance(data, list):
+                        text_content = "\n\n".join([json.dumps(item, ensure_ascii=False) for item in data])
+                    else:
+                        text_content = json.dumps(data, ensure_ascii=False)
+                    docs = [Document(page_content=text_content, metadata={"source": file.name})]
+                else:
+                    docs = []
+
+                if not docs:
+                    st.warning(f"⚠️ No content extracted from {file.name}")
+                    continue
+
                 chunks = text_splitter.split_documents(docs)
 
-                # Add source metadata
                 for chunk in chunks:
                     chunk.metadata["source"] = file.name
 
@@ -158,16 +189,19 @@ with st.sidebar:
                 uploaded_meta[file_hash] = file.name
                 new_files.append(file.name)
             except Exception as e:
-                st.error(f"Error processing {file.name}: {e}")
+                st.error(f"❌ Error processing {file.name}: {e}")
             finally:
-                os.unlink(tmp_path)
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
         if new_files:
             save_uploaded_meta(uploaded_meta)
             st.success(f"✅ Uploaded: {', '.join(new_files)}")
             st.rerun()
         else:
-            st.info("ℹ️ All files already uploaded.")
+            st.info("ℹ️ All files already uploaded or empty.")
 
     # Show uploaded files
     if uploaded_meta:
@@ -189,7 +223,6 @@ with st.sidebar:
         else:
             st.warning("⚠️ Could not fully clear DB. Please restart the app and try again.")
 
-        # Clear cache to force retriever recreation
         st.cache_resource.clear()
         st.rerun()
 
@@ -203,7 +236,9 @@ K_DOCS = 3
 
 @st.cache_resource(ttl="1h")
 def configure_retriever(csize, cover, k):
-    if os.path.exists(CHROMA_DB_PATH):
+    if not os.path.exists(CHROMA_DB_PATH):
+        return None
+    try:
         embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
@@ -214,17 +249,30 @@ def configure_retriever(csize, cover, k):
             collection_name="docs"
         )
         return vectordb.as_retriever(search_kwargs={"k": k})
-    return None
+    except Exception as e:
+        st.error(f"❌ Retriever init failed: {e}")
+        return None
 
 
 retriever = configure_retriever(CHUNK_SIZE, CHUNK_OVERLAP, K_DOCS)
 
+# ========== SHOW CHAT INTERFACE ALWAYS ==========
+# Even if no documents, show chat input (with a warning)
 if retriever is None:
-    st.info("📤 No documents uploaded yet. Please upload PDF files from the sidebar.")
-    st.stop()
+    st.warning("📤 No documents uploaded yet. Please upload PDF or JSON files from the sidebar.")
+    # Create a dummy retriever that returns empty docs so chat still works
+    class DummyRetriever(BaseRetriever):
+        def _get_relevant_documents(self, query):
+            return []
+
+    retriever = DummyRetriever()
 
 # ========== LLM & CHAIN ==========
-llm = ChatGroq(model_name=MODEL, temperature=TEMP, streaming=True)
+try:
+    llm = ChatGroq(model_name=MODEL, temperature=TEMP, streaming=True)
+except Exception as e:
+    st.error(f"❌ LLM init failed: {e}")
+    st.stop()
 
 qa_template = """You are a helpful AI assistant. Use ONLY the following context to answer the question. If the answer is not in the context, say you do not have enough information.
 
@@ -243,8 +291,7 @@ def format_docs(docs):
 
 
 qa_rag_chain = (
-    {"context": itemgetter("question") | retriever |
-     format_docs, "question": itemgetter("question")}
+    {"context": itemgetter("question") | retriever | format_docs, "question": itemgetter("question")}
     | qa_prompt
     | llm
 )
@@ -307,4 +354,4 @@ if user_prompt := st.chat_input("Ask a question..."):
                 {"callbacks": [stream_handler, pm_handler]}
             )
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"❌ Chat error: {e}")
