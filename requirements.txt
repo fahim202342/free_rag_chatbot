@@ -9,3 +9,4 @@ chromadb
 pymupdf
 pandas
 sentence-transformers
+protobuf==3.20.3
