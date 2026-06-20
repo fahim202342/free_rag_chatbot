@@ -1,11 +1,5 @@
-import os
-import sys
-
-# FIX: Set protobuf to use pure Python implementation BEFORE any other imports
-# This prevents the TypeError: Descriptors cannot be created directly error
-os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
-
 import streamlit as st
+import os
 import tempfile
 import hashlib
 import json
@@ -56,20 +50,14 @@ META_FILE = "./uploaded_files_meta.json"
 
 def load_uploaded_meta():
     if os.path.exists(META_FILE):
-        try:
-            with open(META_FILE, "r") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, Exception):
-            return {}
+        with open(META_FILE, "r") as f:
+            return json.load(f)
     return {}
 
 
 def save_uploaded_meta(meta):
-    try:
-        with open(META_FILE, "w") as f:
-            json.dump(meta, f)
-    except Exception:
-        pass
+    with open(META_FILE, "w") as f:
+        json.dump(meta, f)
 
 
 def safe_delete_chroma_db():
@@ -79,6 +67,7 @@ def safe_delete_chroma_db():
 
     # Try to release any chroma connections
     try:
+        # Create a client and delete the collection first
         client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
         try:
             client.delete_collection("docs")
@@ -88,8 +77,10 @@ def safe_delete_chroma_db():
     except Exception:
         pass
 
+    # Wait a moment for file handles to release
     time.sleep(0.5)
 
+    # On Windows, we need to handle locked sqlite files
     max_retries = 5
     for attempt in range(max_retries):
         try:
@@ -99,11 +90,13 @@ def safe_delete_chroma_db():
             if attempt < max_retries - 1:
                 time.sleep(0.5)
             else:
+                # Force delete by renaming first (Windows workaround)
                 try:
                     temp_path = CHROMA_DB_PATH + "_old"
                     if os.path.exists(temp_path):
                         shutil.rmtree(temp_path)
                     os.rename(CHROMA_DB_PATH, temp_path)
+                    # Try to delete the renamed folder
                     shutil.rmtree(temp_path, ignore_errors=True)
                     return True
                 except Exception:
@@ -117,32 +110,25 @@ uploaded_meta = load_uploaded_meta()
 with st.sidebar:
     st.header("📤 Upload Documents")
     uploaded_files = st.file_uploader(
-        "Upload PDF or JSON files",
-        type=["pdf", "json"],
+        "Upload PDF files",
+        type=["pdf"],
         accept_multiple_files=True,
         key="pdf_uploader"
     )
 
     if uploaded_files:
         st.subheader("Processing...")
-        try:
-            embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/all-MiniLM-L6-v2"
-            )
-        except Exception as e:
-            st.error(f"❌ Embedding model load failed: {e}")
-            st.stop()
+        embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
 
-        try:
-            client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-            vectordb = Chroma(
-                client=client,
-                embedding_function=embeddings,
-                collection_name="docs"
-            )
-        except Exception as e:
-            st.error(f"❌ Chroma DB init failed: {e}")
-            st.stop()
+        # Initialize or load Chroma
+        client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+        vectordb = Chroma(
+            client=client,
+            embedding_function=embeddings,
+            collection_name="docs"
+        )
 
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1500,
@@ -155,33 +141,16 @@ with st.sidebar:
             if file_hash in uploaded_meta:
                 continue
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.name)[1]) as tmp:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(file.getvalue())
                 tmp_path = tmp.name
 
             try:
-                if file.name.lower().endswith(".pdf"):
-                    loader = PyMuPDFLoader(tmp_path)
-                    docs = loader.load()
-                elif file.name.lower().endswith(".json"):
-                    with open(tmp_path, "r", encoding="utf-8") as jf:
-                        data = json.load(jf)
-                    # Handle both single object and list of objects
-                    if isinstance(data, list):
-                        text_content = "\n\n".join([json.dumps(item, ensure_ascii=False) for item in data])
-                    else:
-                        text_content = json.dumps(data, ensure_ascii=False)
-                    from langchain_core.documents import Document
-                    docs = [Document(page_content=text_content, metadata={"source": file.name})]
-                else:
-                    docs = []
-
-                if not docs:
-                    st.warning(f"⚠️ No content extracted from {file.name}")
-                    continue
-
+                loader = PyMuPDFLoader(tmp_path)
+                docs = loader.load()
                 chunks = text_splitter.split_documents(docs)
 
+                # Add source metadata
                 for chunk in chunks:
                     chunk.metadata["source"] = file.name
 
@@ -189,19 +158,16 @@ with st.sidebar:
                 uploaded_meta[file_hash] = file.name
                 new_files.append(file.name)
             except Exception as e:
-                st.error(f"❌ Error processing {file.name}: {e}")
+                st.error(f"Error processing {file.name}: {e}")
             finally:
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
+                os.unlink(tmp_path)
 
         if new_files:
             save_uploaded_meta(uploaded_meta)
             st.success(f"✅ Uploaded: {', '.join(new_files)}")
             st.rerun()
         else:
-            st.info("ℹ️ All files already uploaded or empty.")
+            st.info("ℹ️ All files already uploaded.")
 
     # Show uploaded files
     if uploaded_meta:
@@ -223,6 +189,7 @@ with st.sidebar:
         else:
             st.warning("⚠️ Could not fully clear DB. Please restart the app and try again.")
 
+        # Clear cache to force retriever recreation
         st.cache_resource.clear()
         st.rerun()
 
@@ -236,9 +203,7 @@ K_DOCS = 3
 
 @st.cache_resource(ttl="1h")
 def configure_retriever(csize, cover, k):
-    if not os.path.exists(CHROMA_DB_PATH):
-        return None
-    try:
+    if os.path.exists(CHROMA_DB_PATH):
         embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
@@ -249,23 +214,17 @@ def configure_retriever(csize, cover, k):
             collection_name="docs"
         )
         return vectordb.as_retriever(search_kwargs={"k": k})
-    except Exception as e:
-        st.error(f"❌ Retriever init failed: {e}")
-        return None
+    return None
 
 
 retriever = configure_retriever(CHUNK_SIZE, CHUNK_OVERLAP, K_DOCS)
 
 if retriever is None:
-    st.info("📤 No documents uploaded yet. Please upload PDF or JSON files from the sidebar.")
+    st.info("📤 No documents uploaded yet. Please upload PDF files from the sidebar.")
     st.stop()
 
 # ========== LLM & CHAIN ==========
-try:
-    llm = ChatGroq(model_name=MODEL, temperature=TEMP, streaming=True)
-except Exception as e:
-    st.error(f"❌ LLM init failed: {e}")
-    st.stop()
+llm = ChatGroq(model_name=MODEL, temperature=TEMP, streaming=True)
 
 qa_template = """You are a helpful AI assistant. Use ONLY the following context to answer the question. If the answer is not in the context, say you do not have enough information.
 
@@ -284,7 +243,8 @@ def format_docs(docs):
 
 
 qa_rag_chain = (
-    {"context": itemgetter("question") | retriever | format_docs, "question": itemgetter("question")}
+    {"context": itemgetter("question") | retriever |
+     format_docs, "question": itemgetter("question")}
     | qa_prompt
     | llm
 )
@@ -347,4 +307,4 @@ if user_prompt := st.chat_input("Ask a question..."):
                 {"callbacks": [stream_handler, pm_handler]}
             )
         except Exception as e:
-            st.error(f"❌ Chat error: {e}")
+            st.error(f"Error: {e}")
