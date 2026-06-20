@@ -3,9 +3,10 @@ python-dotenv
 langchain-groq
 langchain-community
 langchain-text-splitters
-langlang-chroma
-chromadb>=0.5.0
+langchain-core
 pymupdf
 pandas
 fastembed>=0.3.0
-protobuf<5.0,>=3.19
+faiss-cpu
+scikit-learn
+numpy
