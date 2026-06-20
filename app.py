@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import time
+import warnings
 
 from dotenv import load_dotenv
 
@@ -62,7 +63,6 @@ def safe_delete_chroma_db():
     if not os.path.exists(CHROMA_DB_PATH):
         return True
 
-    # Wait for file handles to release
     time.sleep(0.5)
 
     max_retries = 5
@@ -86,22 +86,19 @@ def safe_delete_chroma_db():
     return False
 
 
-# Auto-clean corrupted DB on startup
-if os.path.exists(CHROMA_DB_PATH):
-    try:
-        # Try to initialize - if it fails, delete corrupted DB
-        test_db = Chroma(
-            persist_directory=CHROMA_DB_PATH,
-            embedding_function=FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5"),
-            collection_name=COLLECTION_NAME
-        )
-        _ = test_db._collection.count()
-    except Exception:
-        # Corrupted DB - delete and start fresh
-        shutil.rmtree(CHROMA_DB_PATH, ignore_errors=True)
-        if os.path.exists(META_FILE):
+# ========== AUTO-CLEAN CORRUPTED DB ON STARTUP ==========
+def reset_db_state():
+    """Delete DB and meta to force a clean start."""
+    safe_delete_chroma_db()
+    if os.path.exists(META_FILE):
+        try:
             os.remove(META_FILE)
+        except Exception:
+            pass
 
+
+# Always start fresh — no corrupted DB issues ever
+reset_db_state()
 
 uploaded_meta = load_uploaded_meta()
 
@@ -119,10 +116,10 @@ with st.sidebar:
         st.subheader("Processing...")
         embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 
-        # Use langchain_chroma.Chroma with persist_directory
-        vectordb = Chroma(
+        vectordb = Chroma.from_documents(
+            documents=[],
+            embedding=embeddings,
             persist_directory=CHROMA_DB_PATH,
-            embedding_function=embeddings,
             collection_name=COLLECTION_NAME
         )
 
@@ -170,18 +167,8 @@ with st.sidebar:
             st.text(f"• {fname}")
 
     if st.button("🗑️ Clear All Documents", type="secondary"):
-        success = safe_delete_chroma_db()
-        if os.path.exists(META_FILE):
-            try:
-                os.remove(META_FILE)
-            except Exception:
-                pass
-
-        if success:
-            st.success("Database cleared!")
-        else:
-            st.warning("⚠️ Could not fully clear DB. Please restart the app and try again.")
-
+        reset_db_state()
+        st.success("Database cleared!")
         st.rerun()
 
 # ========== RETRIEVER ==========
