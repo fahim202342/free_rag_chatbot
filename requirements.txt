@@ -7,6 +7,3 @@ langchain-core
 pymupdf
 pandas
 fastembed>=0.3.0
-faiss-cpu
-scikit-learn
-numpy
