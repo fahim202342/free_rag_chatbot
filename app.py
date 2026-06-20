@@ -4,8 +4,6 @@ import tempfile
 import hashlib
 import json
 import shutil
-import time
-import warnings
 
 from dotenv import load_dotenv
 
@@ -13,13 +11,11 @@ from langchain_groq import ChatGroq
 from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
 from operator import itemgetter
 import pandas as pd
-
 
 # ========== LOAD API KEYS FROM .ENV ==========
 load_dotenv()
@@ -40,65 +36,15 @@ if not GROQ_API_KEY:
     st.error("❌ GROQ_API_KEY missing! Create a `.env` file with GROQ_API_KEY=your_key")
     st.stop()
 
-# ========== PERSISTENT STORAGE SETUP ==========
-CHROMA_DB_PATH = "./chroma_db"
-META_FILE = "./uploaded_files_meta.json"
-COLLECTION_NAME = "rag_docs_v3"
+# ========== SESSION STATE INIT ==========
+if "uploaded_meta" not in st.session_state:
+    st.session_state["uploaded_meta"] = {}
 
+if "vectordb" not in st.session_state:
+    st.session_state["vectordb"] = None
 
-def load_uploaded_meta():
-    if os.path.exists(META_FILE):
-        with open(META_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-
-def save_uploaded_meta(meta):
-    with open(META_FILE, "w") as f:
-        json.dump(meta, f)
-
-
-def safe_delete_chroma_db():
-    """Safely delete Chroma DB."""
-    if not os.path.exists(CHROMA_DB_PATH):
-        return True
-
-    time.sleep(0.5)
-
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            shutil.rmtree(CHROMA_DB_PATH)
-            return True
-        except PermissionError:
-            if attempt < max_retries - 1:
-                time.sleep(0.5)
-            else:
-                try:
-                    temp_path = CHROMA_DB_PATH + "_old"
-                    if os.path.exists(temp_path):
-                        shutil.rmtree(temp_path)
-                    os.rename(CHROMA_DB_PATH, temp_path)
-                    shutil.rmtree(temp_path, ignore_errors=True)
-                    return True
-                except Exception:
-                    return False
-    return False
-
-
-# ========== AGGRESSIVE DB CLEANUP ==========
-# Delete EVERYTHING chroma-related on startup to avoid schema conflicts
-for p in [CHROMA_DB_PATH, CHROMA_DB_PATH + "_old", "./.chroma"]:
-    if os.path.exists(p):
-        shutil.rmtree(p, ignore_errors=True)
-
-if os.path.exists(META_FILE):
-    try:
-        os.remove(META_FILE)
-    except Exception:
-        pass
-
-uploaded_meta = load_uploaded_meta()
+if "has_docs" not in st.session_state:
+    st.session_state["has_docs"] = False
 
 # ========== DOCUMENT UPLOAD SIDEBAR ==========
 with st.sidebar:
@@ -113,12 +59,8 @@ with st.sidebar:
     if uploaded_files:
         st.subheader("Processing...")
 
-        # Use in-memory Chroma — no persistence, no corruption
+        # Pure in-memory embeddings — no disk, no ChromaDB
         embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-        vectordb = Chroma(
-            embedding_function=embeddings,
-            collection_name=COLLECTION_NAME
-        )
 
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1500,
@@ -129,7 +71,7 @@ with st.sidebar:
         all_chunks = []
         for file in uploaded_files:
             file_hash = hashlib.md5(file.getvalue()).hexdigest()
-            if file_hash in uploaded_meta:
+            if file_hash in st.session_state["uploaded_meta"]:
                 continue
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -145,7 +87,7 @@ with st.sidebar:
                     chunk.metadata["source"] = file.name
 
                 all_chunks.extend(chunks)
-                uploaded_meta[file_hash] = file.name
+                st.session_state["uploaded_meta"][file_hash] = file.name
                 new_files.append(file.name)
             except Exception as e:
                 st.error(f"Error processing {file.name}: {e}")
@@ -153,32 +95,37 @@ with st.sidebar:
                 os.unlink(tmp_path)
 
         if all_chunks:
-            vectordb.add_documents(all_chunks)
-            save_uploaded_meta(uploaded_meta)
-            st.success(f"✅ Uploaded: {', '.join(new_files)}")
+            # Try FAISS first (pure in-memory), fallback to simple list search
+            try:
+                from langchain_community.vectorstores import FAISS
+                vectordb = FAISS.from_documents(all_chunks, embeddings)
+                st.session_state["vectordb"] = vectordb
+                st.session_state["has_docs"] = True
+                st.success(f"✅ Uploaded: {', '.join(new_files)}")
+                st.rerun()
+            except Exception as e:
+                # Fallback: store chunks and do simple similarity
+                st.session_state["chunks"] = all_chunks
+                st.session_state["embeddings"] = embeddings
+                st.session_state["has_docs"] = True
+                st.session_state["use_faiss"] = False
+                st.success(f"✅ Uploaded: {', '.join(new_files)} (fallback mode)")
+                st.rerun()
+        else:
+            st.info("ℹ️ All files already uploaded.")
 
-        # Save vectordb to session state so retriever can use it
-        st.session_state["vectordb"] = vectordb
-        st.session_state["has_docs"] = True
-        st.rerun()
-    else:
-        st.session_state["has_docs"] = False
-
-    if uploaded_meta:
+    if st.session_state["uploaded_meta"]:
         st.subheader("📁 Uploaded Files")
-        for fh, fname in uploaded_meta.items():
+        for fh, fname in st.session_state["uploaded_meta"].items():
             st.text(f"• {fname}")
 
     if st.button("🗑️ Clear All Documents", type="secondary"):
+        st.session_state["uploaded_meta"] = {}
         st.session_state["vectordb"] = None
         st.session_state["has_docs"] = False
-        safe_delete_chroma_db()
-        if os.path.exists(META_FILE):
-            try:
-                os.remove(META_FILE)
-            except Exception:
-                pass
-        st.success("Database cleared!")
+        st.session_state["chunks"] = []
+        st.session_state["use_faiss"] = True
+        st.success("Cleared!")
         st.rerun()
 
 # ========== RETRIEVER ==========
@@ -186,16 +133,42 @@ MODEL = "llama-3.3-70b-versatile"
 TEMP = 0.1
 K_DOCS = 3
 
-
-# Get vectordb from session state
-vectordb = st.session_state.get("vectordb", None)
-has_docs = st.session_state.get("has_docs", False)
-
-if not has_docs or vectordb is None:
+if not st.session_state["has_docs"]:
     st.info("📤 No documents uploaded yet. Please upload PDF files from the sidebar.")
     st.stop()
 
-retriever = vectordb.as_retriever(search_kwargs={"k": K_DOCS})
+# Build retriever from session state
+if st.session_state.get("use_faiss", True) and st.session_state["vectordb"] is not None:
+    retriever = st.session_state["vectordb"].as_retriever(search_kwargs={"k": K_DOCS})
+else:
+    # Fallback: simple similarity search using embeddings
+    from langchain_core.documents import Document
+    from sklearn.metrics.pairwise import cosine_similarity
+    import numpy as np
+
+    class SimpleRetriever:
+        def __init__(self, chunks, embeddings, k):
+            self.chunks = chunks
+            self.embeddings = embeddings
+            self.k = k
+            # Pre-compute embeddings for all chunks
+            texts = [c.page_content for c in chunks]
+            self.chunk_embeddings = self.embeddings.embed_documents(texts)
+
+        def invoke(self, query):
+            query_emb = self.embeddings.embed_query(query)
+            similarities = cosine_similarity([query_emb], self.chunk_embeddings)[0]
+            top_k_idx = np.argsort(similarities)[::-1][:self.k]
+            return [self.chunks[i] for i in top_k_idx]
+
+        def get_relevant_documents(self, query):
+            return self.invoke(query)
+
+    retriever = SimpleRetriever(
+        st.session_state.get("chunks", []),
+        st.session_state.get("embeddings"),
+        K_DOCS
+    )
 
 # ========== LLM & CHAIN ==========
 llm = ChatGroq(model_name=MODEL, temperature=TEMP, streaming=True)
@@ -216,8 +189,13 @@ def format_docs(docs):
     return "\n\n".join([d.page_content for d in docs])
 
 
+# Wrap retriever for LCEL compatibility
+from langchain_core.runnables import RunnableLambda
+
+retriever_runnable = RunnableLambda(lambda x: retriever.invoke(x["question"]) if hasattr(retriever, "invoke") else retriever.get_relevant_documents(x["question"]))
+
 qa_rag_chain = (
-    {"context": itemgetter("question") | retriever | format_docs, "question": itemgetter("question")}
+    {"context": itemgetter("question") | retriever_runnable | format_docs, "question": itemgetter("question")}
     | qa_prompt
     | llm
 )
