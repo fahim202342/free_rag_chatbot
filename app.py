@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 # Fix imports for newer langchain versions
 from langchain_groq import ChatGroq
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
@@ -26,7 +26,6 @@ import chromadb
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN", "")
 
 if GROQ_API_KEY:
     os.environ["GROQ_API_KEY"] = GROQ_API_KEY
@@ -67,7 +66,6 @@ def safe_delete_chroma_db():
 
     # Try to release any chroma connections
     try:
-        # Create a client and delete the collection first
         client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
         try:
             client.delete_collection("docs")
@@ -96,7 +94,6 @@ def safe_delete_chroma_db():
                     if os.path.exists(temp_path):
                         shutil.rmtree(temp_path)
                     os.rename(CHROMA_DB_PATH, temp_path)
-                    # Try to delete the renamed folder
                     shutil.rmtree(temp_path, ignore_errors=True)
                     return True
                 except Exception:
@@ -118,9 +115,7 @@ with st.sidebar:
 
     if uploaded_files:
         st.subheader("Processing...")
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
+        embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 
         # Initialize or load Chroma
         client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
@@ -189,8 +184,6 @@ with st.sidebar:
         else:
             st.warning("⚠️ Could not fully clear DB. Please restart the app and try again.")
 
-        # Clear cache to force retriever recreation
-        st.cache_resource.clear()
         st.rerun()
 
 # ========== RETRIEVER ==========
@@ -204,9 +197,7 @@ K_DOCS = 3
 @st.cache_resource(ttl="1h")
 def configure_retriever(csize, cover, k):
     if os.path.exists(CHROMA_DB_PATH):
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
+        embeddings = FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
         client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
         vectordb = Chroma(
             client=client,
@@ -243,8 +234,7 @@ def format_docs(docs):
 
 
 qa_rag_chain = (
-    {"context": itemgetter("question") | retriever |
-     format_docs, "question": itemgetter("question")}
+    {"context": itemgetter("question") | retriever | format_docs, "question": itemgetter("question")}
     | qa_prompt
     | llm
 )
